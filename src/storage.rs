@@ -13,6 +13,10 @@ use tokio::sync::Semaphore;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Command {
+    VersionedEntity {
+        kind: String,
+        id: String,
+    },
     EditTarget {
         kind: String,
         id: String,
@@ -178,6 +182,7 @@ pub(crate) enum Command {
 impl Command {
     fn event(&self) -> &'static str {
         match self {
+            Self::VersionedEntity { .. } => "vault.storage.entity",
             Self::EditTarget { .. } => "vault.storage.edit_target",
             Self::CheckpointHandle { .. } => "vault.storage.checkpoint_handle",
             Self::EnqueueWriter { .. } => "vault.storage.enqueue_writer",
@@ -237,6 +242,7 @@ fn completed(
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
+    VersionedEntity(Option<Entity>, u64),
     EditTarget(crate::journal::EditTarget),
     WriterSnapshot(crate::journal::WriterSnapshot),
     UnknownReason(Option<String>),
@@ -262,6 +268,10 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
+        Command::VersionedEntity { kind, id } => {
+            let (entity, revision) = journal.versioned_entity(&kind, &id)?;
+            Reply::VersionedEntity(entity, revision)
+        }
         Command::EnqueueRepositoryResolution {
             body,
             expected_revision,
@@ -601,6 +611,22 @@ impl Storage {
             .await?
         {
             Reply::Entity(v) => Ok(v),
+            _ => Err(Error::Invalid),
+        }
+    }
+    pub async fn versioned_entity(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<(Option<Entity>, u64), Error> {
+        match self
+            .call(Command::VersionedEntity {
+                kind: kind.into(),
+                id: id.into(),
+            })
+            .await?
+        {
+            Reply::VersionedEntity(entity, revision) => Ok((entity, revision)),
             _ => Err(Error::Invalid),
         }
     }

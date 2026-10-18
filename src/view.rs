@@ -95,6 +95,8 @@ pub struct StateView {
     pub platform: String,
     pub reachability: String,
     pub configured: bool,
+    pub enabled: Option<bool>,
+    pub permissions: Vec<String>,
     pub checked_at_ms: u64,
     pub observed_at_ms: u64,
     pub expires_at_ms: u64,
