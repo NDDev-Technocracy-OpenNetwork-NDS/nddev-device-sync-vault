@@ -201,6 +201,16 @@ impl Journal {
     pub fn entity(&self, kind: &str, id: &str) -> Result<Option<Entity>, Error> {
         self.read(|connection| entity(connection, kind, id))
     }
+    /// The entity and publication order belong to one read transaction. A later
+    /// metadata read cannot label an earlier setting with a newer revision.
+    pub fn versioned_entity(&self, kind: &str, id: &str) -> Result<(Option<Entity>, u64), Error> {
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
+        let value = entity(&tx, kind, id)?;
+        let revision = writer::read(&tx)?.local_revision;
+        tx.commit().map_err(sql_failed)?;
+        Ok((value, revision))
+    }
     pub(crate) fn resolution(
         &self,
         id: &str,
