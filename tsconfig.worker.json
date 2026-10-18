@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": [
+      "ES2024",
+      "WebWorker"
+    ]
+  },
+  "files": [
+    "src/browser_worker.ts"
+  ]
+}

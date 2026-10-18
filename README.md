@@ -99,6 +99,12 @@ fallback. The composition root configures same-origin worker/module assets and
 exports the four functions documented in `src/browser.rs`; no plaintext or keys
 cross the journal command boundary. `just wasm-check` is a compile gate.
 
+Author the browser adapter and worker in `browser_journal.ts` and
+`browser_worker.ts`. Their shared local message envelope contains opaque Rust
+command/result strings. `just browser-check` checks strict DOM/worker types,
+Biome and reproducible JS output using the frozen Bun lockfile; OPFS runtime
+acceptance remains a separate gate.
+
 New unsent
 edits are visible locally and may be replaced only using the displayed
 `pending_id` together with the committed revision. Once claimed for transport,

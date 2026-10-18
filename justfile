@@ -1,6 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-check:
+check: browser-check
     cargo fmt --check
     cargo test --locked --all-features --jobs 4
     cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
@@ -28,3 +28,8 @@ fleet-acceptance:
 # Compile gate only; real browser storage/identity acceptance is separate.
 wasm-check:
     cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown --jobs 4 -- -D warnings
+
+browser-check:
+    bun install --frozen-lockfile --ignore-scripts
+    bun run check
+    bun run check:generated
