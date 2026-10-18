@@ -1566,7 +1566,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-accounts"
 version = "0.0.1-alpha.24"
-source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts?rev=b5b9de9d6b2cce7c435fefa21c4433ba6ed9d4ae#b5b9de9d6b2cce7c435fefa21c4433ba6ed9d4ae"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts?rev=c09e4e9648ec5e83ed1cd23e0ed4f20bb2dab971#c09e4e9648ec5e83ed1cd23e0ed4f20bb2dab971"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
