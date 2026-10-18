@@ -3,7 +3,7 @@ mod client;
 mod codec;
 mod key_discovery;
 pub use client::{
-    CheckpointStage, InboxProgress, RepositoryCatalogCursor, RepositoryCatalogPage,
+    CheckpointStage, InboxProgress, ModuleSetting, RepositoryCatalogCursor, RepositoryCatalogPage,
     RepositoryPublication, RepositoryRead, RepositoryResolution, RetainedRepositoryObservation,
     SyncAttempt, VaultClient,
 };

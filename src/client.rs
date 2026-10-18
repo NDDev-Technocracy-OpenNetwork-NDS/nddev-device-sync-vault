@@ -1081,7 +1081,12 @@ impl VaultClient {
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
-            if snapshots.is_empty() || snapshots.len() > 32 {
+            if snapshots.is_empty()
+                || snapshots.len() > 32
+                || snapshots
+                    .iter()
+                    .any(|snapshot| matches!(snapshot.data, State::ModuleConfiguration { .. }))
+            {
                 return Err(Error::Invalid);
             }
             self.prepare_identity().await?;
@@ -1098,6 +1103,8 @@ impl VaultClient {
                         EntityKind::ModuleState,
                         format!("{}:{module_id}", self.scope.device),
                     ),
+                    // Only the explicit CAS command may change desired state.
+                    State::ModuleConfiguration { .. } => return Err(Error::Invalid),
                     State::Account { .. } => (
                         EntityKind::AccountState,
                         format!("{}:nds", self.scope.device),
@@ -1202,6 +1209,8 @@ impl VaultClient {
                 platform: String::new(),
                 reachability: String::new(),
                 configured: false,
+                enabled: None,
+                permissions: Vec::new(),
                 checked_at_ms: 0,
                 observed_at_ms: snapshot.observed_at_ms,
                 expires_at_ms: 0,
@@ -1241,6 +1250,24 @@ impl VaultClient {
                     .into();
                     value.checked_at_ms = checked_at_ms.unwrap_or(0);
                     value.error_class = error_class.unwrap_or_default();
+                }
+                State::ModuleConfiguration {
+                    module_id,
+                    configuration,
+                } => {
+                    value.kind = "module_configuration".into();
+                    value.label = module_id;
+                    value.enabled = Some(configuration.enabled);
+                    value.permissions = configuration
+                        .permissions
+                        .into_iter()
+                        .map(|permission| {
+                            match serde_json::to_value(permission).map_err(dependency)? {
+                                serde_json::Value::String(tag) => Ok(tag),
+                                _ => Err(Error::Invalid),
+                            }
+                        })
+                        .collect::<Result<_, _>>()?;
                 }
                 State::Account {
                     auth_method,
@@ -1322,7 +1349,6 @@ impl From<nddev_device_sync_domain::sync::SyncError> for Error {
     }
 }
 
-#[cfg(test)]
 fn now_ms() -> Result<u64, Error> {
     (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
         .try_into()
@@ -1914,6 +1940,10 @@ mod checkpoint;
 pub use checkpoint::CheckpointStage;
 
 #[cfg(test)]
+#[path = "module_acceptance.rs"]
+mod module_acceptance;
+
+#[cfg(test)]
 #[path = "catalog_acceptance.rs"]
 mod catalog_acceptance;
 
@@ -1930,3 +1960,7 @@ pub use repository::{
     RepositoryCatalogCursor, RepositoryCatalogPage, RepositoryPublication, RepositoryRead,
     RepositoryResolution, RetainedRepositoryObservation,
 };
+
+#[path = "module_client.rs"]
+mod module;
+pub use module::ModuleSetting;
