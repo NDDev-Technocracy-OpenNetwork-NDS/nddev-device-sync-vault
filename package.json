@@ -1,0 +1,16 @@
+{
+  "name": "@nddev/nds-vault-browser-io",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "packageManager": "bun@1.4.3",
+  "scripts": {
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json && biome check src/*.ts",
+    "generate": "tsc && tsc -p tsconfig.worker.json",
+    "check:generated": "bun run generate && git diff --exit-code -- src/browser_journal.js src/browser_worker.js"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "typescript": "7.0.2"
+  }
+}
