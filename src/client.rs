@@ -86,7 +86,7 @@ fn identity_failure(error: nddev_device_sync_accounts::ClientError) -> Error {
     use nddev_device_sync_accounts::ClientError;
     match error {
         ClientError::Cancelled => Error::Cancelled,
-        ClientError::Busy => Error::Busy,
+        ClientError::Busy | ClientError::OnlineVerificationRequired => Error::Busy,
         ClientError::Server(code) if code == "server_busy" => Error::Busy,
         ClientError::Server(code) if code == "sync_capacity_exhausted" => Error::CapacityExhausted,
         ClientError::DeviceRevoked | ClientError::RevalidationRequired => Error::Locked,
@@ -239,7 +239,9 @@ impl VaultClient {
                 return Err(Error::Locked);
             }
             if !view.session_verified {
-                return Err(Error::Unavailable);
+                // A valid offline grant permits local records. Upload waits
+                // for device verification rather than reporting broken storage.
+                return Err(Error::Busy);
             }
             self.identity.refresh_devices().await.map_err(dependency)?;
             self.authorized()?;
