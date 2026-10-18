@@ -2,6 +2,7 @@
 mod client;
 mod codec;
 mod key_discovery;
+pub mod replication;
 pub use client::{
     CheckpointStage, InboxProgress, ModuleMutation, ModuleSetting, RepositoryCatalogCursor,
     RepositoryCatalogPage, RepositoryPublication, RepositoryRead, RepositoryResolution,
