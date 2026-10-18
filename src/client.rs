@@ -290,6 +290,17 @@ impl VaultClient {
         plaintext: &[u8],
         expected: Option<Expected>,
     ) -> Result<String, Error> {
+        self.put_inner_receipt(kind, id, plaintext, expected)
+            .await
+            .map(|receipt| receipt.id)
+    }
+    async fn put_inner_receipt(
+        &self,
+        kind: EntityKind,
+        id: String,
+        plaintext: &[u8],
+        expected: Option<Expected>,
+    ) -> Result<crate::journal::Enqueued, Error> {
         if plaintext.len() > MAX_PLAIN_BYTES {
             return Err(Error::Invalid);
         }
@@ -500,7 +511,7 @@ impl VaultClient {
             view.local_revision = receipt.local_revision;
             view.catching_up = true;
         }
-        Ok(receipt.id)
+        Ok(receipt)
     }
     pub async fn share_clipboard(&self, text: Zeroizing<String>) -> Result<String, Error> {
         let _permit = self.admitted()?;
@@ -1963,4 +1974,4 @@ pub use repository::{
 
 #[path = "module_client.rs"]
 mod module;
-pub use module::ModuleSetting;
+pub use module::{ModuleMutation, ModuleSetting};

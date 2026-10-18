@@ -6,9 +6,18 @@ use nddev_device_sync_domain::modules::control::Configuration as ModuleConfigura
 #[derive(Clone, Default)]
 pub struct ModuleSetting {
     pub configuration: ModuleConfiguration,
+    /// Stable across local acknowledgement, changed by every distinct edit.
+    pub operation_id: Option<String>,
     pub revision: u64,
+    pub local_revision: u64,
     pub pending_id: Option<String>,
     pub conflicted: bool,
+}
+
+/// Frozen local publication metadata; not a server acknowledgement.
+pub struct ModuleMutation {
+    pub operation_id: String,
+    pub local_revision: u64,
 }
 
 impl VaultClient {
@@ -26,8 +35,12 @@ impl VaultClient {
         let _permit = self.admitted()?;
         let id = self.module_configuration_id(module)?;
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let Some(entity) = self.journal.entity("module_state", &id).await? else {
-            return Ok(ModuleSetting::default());
+        let (entity, local_revision) = self.journal.versioned_entity("module_state", &id).await?;
+        let Some(entity) = entity else {
+            return Ok(ModuleSetting {
+                local_revision,
+                ..Default::default()
+            });
         };
         let envelope = codec::versioned(&entity.body)?;
         let bytes = key.decrypt_versioned(&self.scope, &envelope)?;
@@ -47,7 +60,9 @@ impl VaultClient {
         };
         Ok(ModuleSetting {
             configuration,
+            operation_id: Some(envelope.operation.id),
             revision: entity.revision,
+            local_revision,
             pending_id: entity.pending_id,
             conflicted: entity.conflicted,
         })
@@ -62,6 +77,22 @@ impl VaultClient {
         expected_pending: Option<String>,
         configuration: ModuleConfiguration,
     ) -> Result<String, Error> {
+        self.set_module_configuration_attempt(
+            module,
+            expected_revision,
+            expected_pending,
+            configuration,
+        )
+        .await
+        .map(|receipt| receipt.operation_id)
+    }
+    pub async fn set_module_configuration_attempt(
+        &self,
+        module: String,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        configuration: ModuleConfiguration,
+    ) -> Result<ModuleMutation, Error> {
         let _permit = self.admitted()?;
         let id = self.module_configuration_id(&module)?;
         if self
@@ -88,18 +119,23 @@ impl VaultClient {
             )
             .map_err(|_| Error::Invalid)?;
         let bytes = Zeroizing::new(serde_json::to_vec(&snapshot).map_err(dependency)?);
-        self.put_inner(
-            EntityKind::ModuleState,
-            id,
-            &bytes,
-            Some(Expected {
-                revision: expected_revision,
-                pending: expected_pending,
-                resolution: None,
-                observed_base: None,
-                observation: None,
-            }),
-        )
-        .await
+        let receipt = self
+            .put_inner_receipt(
+                EntityKind::ModuleState,
+                id,
+                &bytes,
+                Some(Expected {
+                    revision: expected_revision,
+                    pending: expected_pending,
+                    resolution: None,
+                    observed_base: None,
+                    observation: None,
+                }),
+            )
+            .await?;
+        Ok(ModuleMutation {
+            operation_id: receipt.id,
+            local_revision: receipt.local_revision,
+        })
     }
 }

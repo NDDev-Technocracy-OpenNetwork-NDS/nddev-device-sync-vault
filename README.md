@@ -69,6 +69,10 @@ revision/pending/conflict evidence; `set_module_configuration` uses the same
 revision and pending-ID compare-and-swap as record edits. It acknowledges local
 durability and works under valid offline authority; ordinary reconciliation
 commits it later. Automatic observation publication cannot change configuration.
+The original operation identity survives acknowledgement and changes on a new
+choice, including identical reapproval after withdrawal. Reads bind that identity
+to the local revision in one transaction; mutation attempts return the frozen
+publication receipt, so later metadata cannot relabel an earlier result.
 NDS permission consent does not grant OS/browser access or prove provider readiness.
 
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.

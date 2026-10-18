@@ -35,6 +35,7 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             .await?;
         let pending = vault.module_configuration("gds").await?;
         assert_eq!(pending.configuration, enabled);
+        assert_eq!(pending.operation_id.as_deref(), Some(operation.as_str()));
         assert_eq!(pending.pending_id.as_deref(), Some(operation.as_str()));
         assert!(matches!(
             vault
@@ -67,9 +68,26 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             },
         };
         vault.publish_states(vec![observation]).await?;
-        let committed = vault.module_configuration("gds").await?;
+        let mut committed = vault.module_configuration("gds").await?;
+        for _ in 0..4 {
+            if committed.pending_id.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            vault.synchronize().await?;
+            committed = vault.module_configuration("gds").await?;
+        }
         assert_eq!(committed.configuration, enabled);
-        assert!(committed.pending_id.is_none() && committed.revision == 1 && !committed.conflicted);
+        assert_eq!(committed.operation_id, pending.operation_id);
+        assert!(committed.local_revision >= pending.local_revision);
+        assert!(
+            committed.pending_id.is_none() && committed.revision == 1 && !committed.conflicted,
+            "module setting did not settle: revision={} pending={} conflicted={} sync_error={}",
+            committed.revision,
+            committed.pending_id.is_some(),
+            committed.conflicted,
+            vault.snapshot().sync_error
+        );
         let states = vault.states(String::new()).await?;
         assert!(states.items.iter().any(|v| v.kind == "module_configuration"
             && v.enabled == Some(true)
@@ -84,18 +102,24 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
         tests::fixture_mode(&receipt, "offline").await?;
         identity.refresh().await.map_err(dependency)?;
         assert!(identity.view().offline_authorized);
-        let operation = vault
-            .set_module_configuration(
+        let mutation = vault
+            .set_module_configuration_attempt(
                 "gds".into(),
                 committed.revision,
                 None,
                 Configuration::default(),
             )
             .await?;
+        let operation = mutation.operation_id;
+
         let reopened = VaultClient::new(identity.clone(), directory.clone()).await?;
         let retained = reopened.module_configuration("gds").await?;
         assert_eq!(retained.configuration, Configuration::default());
         assert_eq!(retained.pending_id.as_deref(), Some(operation.as_str()));
+        assert_eq!(retained.operation_id.as_deref(), Some(operation.as_str()));
+        assert_ne!(retained.operation_id, committed.operation_id);
+        assert_eq!(retained.local_revision, mutation.local_revision);
+        assert!(retained.local_revision > committed.local_revision);
         assert!(matches!(
             vault
                 .set_module_configuration("gds".into(), committed.revision, None, enabled)
@@ -117,6 +141,21 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
         let settled = reopened.module_configuration("gds").await?;
         assert_eq!(settled.configuration, Configuration::default());
         assert!(settled.pending_id.is_none() && settled.revision == 2 && !settled.conflicted);
+        assert_eq!(settled.operation_id, retained.operation_id);
+        // Returning to the same values is a new consent epoch, not revival of
+        // the original authorization captured before the explicit withdrawal.
+        let restored = reopened
+            .set_module_configuration(
+                "gds".into(),
+                settled.revision,
+                None,
+                pending.configuration.clone(),
+            )
+            .await?;
+        let renewed = reopened.module_configuration("gds").await?;
+        assert_eq!(renewed.configuration, committed.configuration);
+        assert_eq!(renewed.operation_id.as_deref(), Some(restored.as_str()));
+        assert_ne!(renewed.operation_id, committed.operation_id);
         identity.logout().await.map_err(dependency)?;
         assert!(matches!(
             reopened.module_configuration("gds").await,
