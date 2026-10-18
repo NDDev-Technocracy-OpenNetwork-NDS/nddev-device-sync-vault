@@ -239,7 +239,9 @@ impl VaultClient {
                 return Err(Error::Locked);
             }
             if !view.session_verified {
-                return Err(Error::Unavailable);
+                // A valid offline grant permits local records. Upload waits
+                // for device verification rather than reporting broken storage.
+                return Err(Error::Busy);
             }
             self.identity.refresh_devices().await.map_err(dependency)?;
             self.authorized()?;
