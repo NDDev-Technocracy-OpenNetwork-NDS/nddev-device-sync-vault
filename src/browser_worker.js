@@ -1,36 +1,115 @@
-// The composition root exports exactly these typed journal entrypoints from its
-// WASM bundle. This worker never receives credential material or arbitrary SQL.
-let module,scope,busy=false;
-self.onmessage=async({data})=>{
-  if(busy){self.postMessage({id:data.id,error:'vault_busy'});return;}
-  busy=true;
-  const controller=new AbortController();
-  let timer;
-  async function locked(operation){
-    timer=setTimeout(()=>controller.abort(),1000);
-    return navigator.locks.request('nds-replica:'+scope,{signal:controller.signal},async()=>{
-      clearTimeout(timer);return operation();
-    });
-  }
-  try {
-    if(data.action==='initialize') {
-      const url=new URL(data.module);
-      if(module||url.origin!==location.origin||!url.pathname.endsWith('.js')||url.search||url.hash||!/^[a-f0-9]{64}$/.test(data.scope))throw new Error();
-      scope=data.scope;module=await import(url.href);await module.default();
-      await locked(()=>module.nds_journal_open(scope));
-      self.postMessage({id:data.id,result:'ready'});
-    } else if(data.action==='execute'&&module&&typeof data.command==='string'&&data.command.length<=8*1024*1024) {
-      const result=await locked(async()=>{
-        await module.nds_journal_resume();
-        try{return module.nds_journal_execute(data.command);}
-        finally{module.nds_journal_pause();}
-      });
-      self.postMessage({id:data.id,result});
-    } else throw new Error();
-  } catch {
-    self.postMessage({id:data.id,error:controller.signal.aborted?'vault_busy':'vault_dependency_unavailable'});
-    // A trap or failed pause may retain a native SQLite connection. Terminate
-    // this owned realm so OPFS releases handles before any later attempt.
-    if(!controller.signal.aborted)self.close();
-  } finally {clearTimeout(timer);busy=false;}
+async function loadModule(url) {
+    const module = await import(url);
+    if (typeof module !== "object" ||
+        module === null ||
+        !("default" in module) ||
+        typeof module.default !== "function" ||
+        !("nds_journal_open" in module) ||
+        typeof module.nds_journal_open !== "function" ||
+        !("nds_journal_resume" in module) ||
+        typeof module.nds_journal_resume !== "function" ||
+        !("nds_journal_execute" in module) ||
+        typeof module.nds_journal_execute !== "function" ||
+        !("nds_journal_pause" in module) ||
+        typeof module.nds_journal_pause !== "function")
+        throw new Error();
+    const { nds_journal_open: open, nds_journal_resume: resume, nds_journal_execute: execute, nds_journal_pause: pause, } = module;
+    await module.default();
+    return {
+        async open(scope) {
+            await open(scope);
+        },
+        async resume() {
+            await resume();
+        },
+        execute(command) {
+            const result = execute(command);
+            if (typeof result !== "string")
+                throw new Error();
+            return result;
+        },
+        pause() {
+            pause();
+        },
+    };
+}
+let active;
+let busy = false;
+const respond = (reply) => self.postMessage(reply);
+self.onmessage = async ({ data }) => {
+    if (typeof data !== "object" || data === null || !("id" in data) || typeof data.id !== "number")
+        throw new Error();
+    const id = data.id;
+    if (busy) {
+        respond({ id, error: "vault_busy" });
+        return;
+    }
+    busy = true;
+    const controller = new AbortController();
+    let timer;
+    async function locked(scope, operation) {
+        timer = setTimeout(() => controller.abort(), 1000);
+        return navigator.locks.request(`nds-replica:${scope}`, { signal: controller.signal }, async () => {
+            clearTimeout(timer);
+            return operation();
+        });
+    }
+    try {
+        if ("action" in data &&
+            data.action === "initialize" &&
+            "module" in data &&
+            typeof data.module === "string" &&
+            "scope" in data &&
+            typeof data.scope === "string") {
+            const url = new URL(data.module);
+            if (active ||
+                url.origin !== location.origin ||
+                !url.pathname.endsWith(".js") ||
+                url.search ||
+                url.hash ||
+                !/^[a-f0-9]{64}$/.test(data.scope))
+                throw new Error();
+            const module = await loadModule(url.href);
+            const scope = data.scope;
+            active = { module, scope };
+            await locked(scope, () => module.open(scope));
+            respond({ id, result: "ready" });
+        }
+        else if ("action" in data &&
+            data.action === "execute" &&
+            active &&
+            "command" in data &&
+            typeof data.command === "string" &&
+            data.command.length <= 8 * 1024 * 1024) {
+            const { module, scope } = active;
+            const command = data.command;
+            const result = await locked(scope, async () => {
+                await module.resume();
+                try {
+                    return module.execute(command);
+                }
+                finally {
+                    module.pause();
+                }
+            });
+            respond({ id, result });
+        }
+        else
+            throw new Error();
+    }
+    catch {
+        respond({
+            id,
+            error: controller.signal.aborted ? "vault_busy" : "vault_dependency_unavailable",
+        });
+        // A trap or failed pause can retain SQLite; terminating this owned realm
+        // releases OPFS handles before another caller attempts recovery.
+        if (!controller.signal.aborted)
+            self.close();
+    }
+    finally {
+        clearTimeout(timer);
+        busy = false;
+    }
 };
+export {};
