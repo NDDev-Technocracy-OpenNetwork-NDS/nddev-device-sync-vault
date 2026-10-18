@@ -1,0 +1,321 @@
+//! One bounded replica-task adapter shared by native/Flutter/browser/CLI callers.
+//! Core owns scheduling and recovery policy; Vault owns the existing journal I/O.
+use crate::{
+    VaultClient,
+    view::{VaultError, VaultView},
+};
+use nddev_device_sync_accounts::{
+    IdentityClient,
+    runtime::{self, Instant},
+    view::ClientError,
+};
+use nddev_device_sync_application::{
+    lifecycle::{BatchOutcome, CapacityCheck, ReplicaSchedule},
+    replica::CapacityProbeOutcome,
+};
+use std::{
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
+use tracing::Instrument;
+
+/// Existing session/publication ownership supplied by the assembly. Starting or
+/// replacing a task must hold `publication`; it is not an authorization grant.
+pub struct ReplicaContext {
+    pub identity: Arc<IdentityClient>,
+    pub vault: Weak<VaultClient>,
+    pub publication: Arc<Mutex<()>>,
+    pub policy_slot: Arc<Mutex<Arc<Mutex<ReplicaSchedule>>>>,
+    pub schedule: Arc<Mutex<ReplicaSchedule>>,
+    /// Continuous clients publish their device observation once. A bounded CLI
+    /// read does not rewrite installation metadata.
+    pub client_version: Option<String>,
+}
+
+pub struct ReplicaTask {
+    active: tokio::sync::watch::Sender<bool>,
+    task: Option<runtime::Task>,
+    updates: tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>>,
+}
+impl ReplicaTask {
+    pub fn spawn(context: ReplicaContext, initial_delay: Duration, active: bool) -> Self {
+        let ReplicaContext {
+            identity,
+            vault: weak,
+            publication,
+            policy_slot,
+            schedule,
+            client_version,
+        } = context;
+        let (active, mut enabled) = tokio::sync::watch::channel(active);
+        let (progress, updates) = tokio::sync::watch::channel(None);
+        let task = runtime::spawn(async move {
+            let mut schedule = schedule;
+            let mut delay = initial_delay;
+            let mut published = client_version.is_none();
+            loop {
+                if !*enabled.borrow() {
+                    if enabled.changed().await.is_err() {
+                        break;
+                    }
+                    delay = Duration::ZERO;
+                    continue;
+                }
+                tokio::select! {
+                    changed = enabled.changed() => { if changed.is_err() { break; } delay = Duration::ZERO; continue; }
+                    _ = runtime::sleep(delay) => {}
+                }
+                let (capacity_check, probe) = {
+                    let policy = schedule.lock().unwrap_or_else(|e| e.into_inner());
+                    (policy.capacity_check(), policy.capacity_probe())
+                };
+                let inbox_only = capacity_check.is_some() && probe.is_none();
+                let mut inbox_at_head = None;
+                let mut inbox_empty = false;
+                let mut capacity_outcome = None;
+                let mut attempt_history = None;
+                let lifetime = identity.local_use_lifetime();
+                let Some(vault) = weak.upgrade() else {
+                    break;
+                };
+                let result = tokio::select! {
+                    changed = enabled.changed() => { if changed.is_err() { break; } delay = Duration::ZERO; continue; }
+                    result = observe("sync.replica.batch", async {
+                        // Authority maintenance belongs to this same replica
+                        // lifetime even when presentation ticks are suspended.
+                        identity.maintain_authorization().await.map_err(replica_auth_error)?;
+                        if probe.is_some() {
+                            let attempt = vault.probe_capacity_attempt().await?;
+                            attempt_history = attempt.history;
+                            capacity_outcome = attempt.result?;
+                            return vault.refresh_local().await;
+                        }
+                        if inbox_only {
+                            let attempt = vault.synchronize_attempt(true).await?;
+                            attempt_history = attempt.history;
+                            let progress = attempt.result?;
+                            inbox_at_head = Some(progress.inbox_at_head);
+                            inbox_empty = progress.caught_up;
+                            return Ok(progress.view);
+                        }
+                        let attempt = vault.synchronize_attempt(false).await?;
+                        attempt_history = attempt.history;
+                        let progress = attempt.result?;
+                        inbox_at_head = Some(progress.inbox_at_head);
+                        let view = progress.view;
+                        if !published && !view.catching_up && !schedule.lock().unwrap_or_else(|e| e.into_inner()).is_capacity_blocked() {
+                            let attempt = vault.publish_states_attempt(device_observations(&identity, client_version.as_deref().ok_or(VaultError::Invalid)?)?).await?;
+                            attempt_history = attempt.history;
+                            let view = attempt.result?;
+                            published = true;
+                            return Ok(view);
+                        }
+                        Ok(view)
+                    }) => result
+                };
+                {
+                    let mut policy = schedule.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(history) = attempt_history {
+                        policy.observe_history(history);
+                        if inbox_only
+                            && result.is_ok()
+                            && inbox_at_head == Some(true)
+                            && let Some(check) = &capacity_check
+                        {
+                            policy.observe_capacity_inbox(check, history);
+                        }
+                    }
+                    if inbox_only && inbox_at_head == Some(true) && inbox_empty && result.is_ok() {
+                        capacity_outcome = Some(CapacityProbeOutcome::NoEligibleWork);
+                    }
+                }
+                if let (Some(check), Some(completed)) = (&capacity_check, capacity_outcome)
+                    && let Ok(fence) = identity.local_use_fence_from(&lifetime).await
+                {
+                    let replacement = {
+                        let _publication = publication.lock().unwrap_or_else(|e| e.into_inner());
+                        if identity.check_local_use_lifetime(&fence).is_ok() {
+                            recovered_policy(&policy_slot, &schedule, check, completed)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(next) = replacement {
+                        schedule = next;
+                        tracing::info!(
+                            event.name = "sync.capacity.recovered",
+                            module = "vault",
+                            outcome = "ok"
+                        );
+                    }
+                }
+                let outcome = match (result.is_ok(), inbox_at_head) {
+                    (true, Some(true))
+                        if inbox_only
+                            || result.as_ref().is_ok_and(|v| !v.sync_error.is_empty()) =>
+                    {
+                        BatchOutcome::InboxHead
+                    }
+                    (true, Some(false)) if inbox_only => BatchOutcome::InboxMore,
+                    _ => batch_outcome(&result),
+                };
+                let sample = if matches!(outcome, BatchOutcome::Retryable) {
+                    uuid::Uuid::new_v4().as_u128() as u16
+                } else {
+                    0
+                };
+                let next = schedule
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .after_with_sample(outcome, sample);
+                progress.send_replace(Some(result));
+                let Some(next) = next else {
+                    break;
+                };
+                delay = next;
+            }
+        });
+        Self {
+            active,
+            task: Some(task),
+            updates,
+        }
+    }
+    pub fn set_active(&self, active: bool) {
+        self.active.send_replace(active);
+    }
+    pub fn is_active(&self) -> bool {
+        *self.active.borrow()
+    }
+    pub fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+    /// Latest actual completed batch; there is no unbounded notification queue.
+    pub fn updates(&self) -> tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>> {
+        self.updates.clone()
+    }
+    /// Abort now and retain the future for the caller's existing bounded join.
+    pub fn cancel(&mut self) -> Option<runtime::Task> {
+        let task = self.task.take();
+        if let Some(task) = &task {
+            task.abort();
+        }
+        task
+    }
+}
+impl Drop for ReplicaTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+// Caller holds publication and has checked the original Accounts lifetime.
+pub fn recovered_policy(
+    slot: &Mutex<Arc<Mutex<ReplicaSchedule>>>,
+    expected: &Arc<Mutex<ReplicaSchedule>>,
+    check: &CapacityCheck,
+    outcome: CapacityProbeOutcome,
+) -> Option<Arc<Mutex<ReplicaSchedule>>> {
+    let mut current = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if !Arc::ptr_eq(&current, expected) {
+        return None;
+    }
+    let replacement = expected
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .recovered_capacity(check, outcome)?;
+    let replacement = Arc::new(Mutex::new(replacement));
+    *current = replacement.clone();
+    Some(replacement)
+}
+
+pub fn batch_outcome(result: &Result<VaultView, VaultError>) -> BatchOutcome {
+    match result {
+        Ok(view) if view.catching_up => BatchOutcome::CatchingUp,
+        Ok(_) => BatchOutcome::CaughtUp,
+        Err(VaultError::CapacityExhausted) => BatchOutcome::CapacityExhausted,
+        Err(VaultError::Locked) => BatchOutcome::Locked,
+        Err(_) => BatchOutcome::Retryable,
+    }
+}
+
+pub fn device_observations(
+    identity: &IdentityClient,
+    client_version: &str,
+) -> Result<Vec<nddev_device_sync_domain::state::Snapshot>, VaultError> {
+    use nddev_device_sync_domain::state::{Snapshot, State};
+    let view = identity.view();
+    let device = view
+        .devices
+        .into_iter()
+        .find(|value| value.is_current && !value.revoked)
+        .ok_or(VaultError::Locked)?;
+    let observed_at_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
+    let capture = |data| Snapshot {
+        schema_version: 1,
+        observed_at_ms,
+        data,
+    };
+    let expires = time::OffsetDateTime::parse(
+        &view.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| VaultError::Invalid)?
+    .unix_timestamp();
+    let millis = |seconds: i64| {
+        u64::try_from(seconds)
+            .ok()
+            .and_then(|value| value.checked_mul(1000))
+            .ok_or(VaultError::Invalid)
+    };
+    let values = vec![
+        capture(State::Device {
+            display_name: device.display_name,
+            platform: device.platform,
+            client_version: client_version.into(),
+        }),
+        capture(State::Account {
+            auth_method: view.auth_method,
+            checked_at_ms: millis(view.session_checked_at)?,
+            expires_at_ms: millis(expires)?,
+        }),
+    ];
+    Ok(values)
+}
+
+fn replica_auth_error(error: ClientError) -> VaultError {
+    match error {
+        ClientError::Busy | ClientError::OnlineVerificationRequired => VaultError::Busy,
+        ClientError::Server(code) if code == "server_busy" => VaultError::Busy,
+        ClientError::Server(code) if code == "sync_capacity_exhausted" => {
+            VaultError::CapacityExhausted
+        }
+        ClientError::DeviceRevoked | ClientError::RevalidationRequired => VaultError::Locked,
+        _ => VaultError::Unavailable,
+    }
+}
+
+async fn observe<T>(
+    event: &'static str,
+    work: impl std::future::Future<Output = Result<T, VaultError>>,
+) -> Result<T, VaultError> {
+    let span = nddev_device_sync_telemetry::operation_span("vault", "process")
+        .map_err(|_| VaultError::Unavailable)?;
+    let completion = span.clone();
+    async {
+        let start = Instant::now();
+        let result = Box::pin(work).await;
+        match &result {
+            Ok(_) => tracing::info!(event.name=event, module="vault", duration_ms=start.elapsed().as_millis() as u64, outcome="ok"),
+            Err(error) => {
+                nddev_device_sync_telemetry::finish_operation_span(&completion, matches!(error, VaultError::Unavailable|VaultError::Authentication|VaultError::StorageFull|VaultError::CapacityExhausted));
+                tracing::warn!(event.name=event, module="vault", duration_ms=start.elapsed().as_millis() as u64, error.type=%error.code(), outcome="error");
+            }
+        }
+        result
+    }.instrument(span).await
+}
