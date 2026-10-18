@@ -32,8 +32,13 @@ pub struct ReplicaContext {
     pub client_version: Option<String>,
 }
 
+struct Activity {
+    active: bool,
+    interruption: Arc<()>,
+}
+
 pub struct ReplicaTask {
-    active: tokio::sync::watch::Sender<bool>,
+    active: tokio::sync::watch::Sender<Activity>,
     task: Option<runtime::Task>,
     updates: tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>>,
 }
@@ -47,14 +52,17 @@ impl ReplicaTask {
             schedule,
             client_version,
         } = context;
-        let (active, mut enabled) = tokio::sync::watch::channel(active);
+        let (active, mut enabled) = tokio::sync::watch::channel(Activity {
+            active,
+            interruption: Arc::new(()),
+        });
         let (progress, updates) = tokio::sync::watch::channel(None);
         let task = runtime::spawn(async move {
             let mut schedule = schedule;
             let mut delay = initial_delay;
             let mut published = client_version.is_none();
             loop {
-                if !*enabled.borrow() {
+                if !enabled.borrow().active {
                     if enabled.changed().await.is_err() {
                         break;
                     }
@@ -78,12 +86,15 @@ impl ReplicaTask {
                 let Some(vault) = weak.upgrade() else {
                     break;
                 };
-                let result = tokio::select! {
-                    changed = enabled.changed() => { if changed.is_err() { break; } delay = Duration::ZERO; continue; }
-                    result = observe("sync.replica.batch", async {
+                let Some(result) = run_enabled(
+                    &mut enabled,
+                    observe("sync.replica.batch", async {
                         // Authority maintenance belongs to this same replica
                         // lifetime even when presentation ticks are suspended.
-                        identity.maintain_authorization().await.map_err(replica_auth_error)?;
+                        identity
+                            .maintain_authorization()
+                            .await
+                            .map_err(replica_auth_error)?;
                         if probe.is_some() {
                             let attempt = vault.probe_capacity_attempt().await?;
                             attempt_history = attempt.history;
@@ -103,15 +114,31 @@ impl ReplicaTask {
                         let progress = attempt.result?;
                         inbox_at_head = Some(progress.inbox_at_head);
                         let view = progress.view;
-                        if !published && !view.catching_up && !schedule.lock().unwrap_or_else(|e| e.into_inner()).is_capacity_blocked() {
-                            let attempt = vault.publish_states_attempt(device_observations(&identity, client_version.as_deref().ok_or(VaultError::Invalid)?)?).await?;
+                        if !published
+                            && !view.catching_up
+                            && !schedule
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .is_capacity_blocked()
+                        {
+                            let attempt = vault
+                                .publish_states_attempt(device_observations(
+                                    &identity,
+                                    client_version.as_deref().ok_or(VaultError::Invalid)?,
+                                )?)
+                                .await?;
                             attempt_history = attempt.history;
                             let view = attempt.result?;
                             published = true;
                             return Ok(view);
                         }
                         Ok(view)
-                    }) => result
+                    }),
+                )
+                .await
+                else {
+                    delay = Duration::ZERO;
+                    continue;
                 };
                 {
                     let mut policy = schedule.lock().unwrap_or_else(|e| e.into_inner());
@@ -182,10 +209,10 @@ impl ReplicaTask {
         }
     }
     pub fn set_active(&self, active: bool) {
-        self.active.send_replace(active);
+        set_activity(&self.active, active);
     }
     pub fn is_active(&self) -> bool {
-        *self.active.borrow()
+        self.active.borrow().active
     }
     pub fn is_running(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
@@ -287,7 +314,7 @@ pub fn device_observations(
     Ok(values)
 }
 
-fn replica_auth_error(error: ClientError) -> VaultError {
+pub fn replica_auth_error(error: ClientError) -> VaultError {
     match error {
         ClientError::Busy | ClientError::OnlineVerificationRequired => VaultError::Busy,
         ClientError::Server(code) if code == "server_busy" => VaultError::Busy,
@@ -318,4 +345,122 @@ async fn observe<T>(
         }
         result
     }.instrument(span).await
+}
+
+// A wake preserves the current I/O future. A pause changes its interruption
+// identity even if pause/resume coalesce before the receiver is polled.
+fn set_activity(sender: &tokio::sync::watch::Sender<Activity>, active: bool) {
+    sender.send_modify(|state| {
+        if state.active && !active {
+            state.interruption = Arc::new(());
+        }
+        state.active = active;
+    });
+}
+
+async fn run_enabled<T>(
+    enabled: &mut tokio::sync::watch::Receiver<Activity>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let epoch = {
+        let state = enabled.borrow_and_update();
+        if !state.active {
+            return None;
+        }
+        state.interruption.clone()
+    };
+    let mut work = Box::pin(work);
+    loop {
+        tokio::select! {
+            result = &mut work => {
+                let state = enabled.borrow();
+                return (state.active && Arc::ptr_eq(&epoch, &state.interruption)).then_some(result);
+            }
+            changed = enabled.changed() => {
+                if changed.is_err() { return None; }
+                let state = enabled.borrow_and_update();
+                if !state.active || !Arc::ptr_eq(&epoch, &state.interruption) { return None; }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod execution_tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::watch,
+    };
+
+    #[tokio::test]
+    async fn wake_keeps_the_same_actual_tcp_read_alive() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            let work = async move {
+                let mut byte = [0];
+                client.read_exact(&mut byte).await.unwrap();
+                byte[0]
+            };
+            let mut work = Box::pin(work);
+            let (polls, mut observed) = watch::channel(0u32);
+            let mut count = 0;
+            let tracked = std::future::poll_fn(move |cx| {
+                count += 1;
+                polls.send_replace(count);
+                work.as_mut().poll(cx)
+            });
+            let (active, mut enabled) = watch::channel(Activity {
+                active: true,
+                interruption: Arc::new(()),
+            });
+            let task = tokio::spawn(async move { run_enabled(&mut enabled, tracked).await });
+            observed.changed().await.unwrap();
+            observed.borrow_and_update();
+            set_activity(&active, true);
+            // A real repoll must occur after the wake. Cancelling/recreating the
+            // read instead closes this observation channel and the TCP peer.
+            observed.changed().await.unwrap();
+            server.write_all(b"x").await.unwrap();
+            assert_eq!(task.await.unwrap(), Some(b'x'));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn coalesced_pause_resume_cancels_pending_tcp_io() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let work = async move {
+                started.send(()).unwrap();
+                let mut byte = [0];
+                client.read_exact(&mut byte).await.unwrap();
+                byte[0]
+            };
+            let (active, mut enabled) = watch::channel(Activity {
+                active: true,
+                interruption: Arc::new(()),
+            });
+            let task = tokio::spawn(async move { run_enabled(&mut enabled, work).await });
+            ready.await.unwrap();
+            set_activity(&active, false);
+            set_activity(&active, true);
+            assert_eq!(task.await.unwrap(), None);
+            let mut byte = [0];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        })
+        .await
+        .unwrap();
+    }
 }
