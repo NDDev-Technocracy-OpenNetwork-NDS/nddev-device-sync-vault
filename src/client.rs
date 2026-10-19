@@ -252,6 +252,10 @@ impl VaultClient {
         self.authorized()?;
         self.journal.owner_lock().await
     }
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pub(crate) async fn drain_replica(&self) -> Result<(), Error> {
+        self.journal.drain().await
+    }
     #[cfg(not(target_arch = "wasm32"))]
     async fn replica_snapshot(&self) -> Result<crate::journal::ReplicaSnapshot, Error> {
         match self
@@ -1253,51 +1257,7 @@ impl VaultClient {
             }
             self.prepare_identity().await?;
             self.synchronize_inner().await?;
-            let key = self.key().await?.ok_or(Error::Locked)?;
-            let writer = DeviceId::new(self.scope.device.clone()).map_err(dependency)?;
-            let mut targets = std::collections::BTreeSet::new();
-            let mut prepared = Vec::new();
-            for snapshot in snapshots {
-                let (kind, id) = match &snapshot.data {
-                    State::Repository { .. } => return Err(Error::Invalid),
-                    State::Device { .. } => (EntityKind::DeviceState, self.scope.device.clone()),
-                    State::Module { module_id, .. } => (
-                        EntityKind::ModuleState,
-                        format!("{}:{module_id}", self.scope.device),
-                    ),
-                    // Only the explicit CAS command may change desired state.
-                    State::ModuleConfiguration { .. } => return Err(Error::Invalid),
-                    State::Account { .. } => (
-                        EntityKind::AccountState,
-                        format!("{}:nds", self.scope.device),
-                    ),
-                };
-                snapshot
-                    .validate(&writer, kind, &id)
-                    .map_err(|_| Error::Invalid)?;
-                if !targets.insert((kind.as_str(), id.clone())) {
-                    return Err(Error::Invalid);
-                }
-                let lookup_id = id.clone();
-                let previous = self.journal.entity(kind.as_str(), &lookup_id).await?;
-                if let Some(previous) = previous {
-                    let envelope = codec::versioned(&previous.body)?;
-                    let bytes = key.decrypt_versioned(&self.scope, &envelope)?;
-                    if let Ok(previous) = serde_json::from_slice::<Snapshot>(&bytes)
-                        && previous.data == snapshot.data
-                    {
-                        continue;
-                    }
-                }
-                let bytes = Zeroizing::new(serde_json::to_vec(&snapshot).map_err(dependency)?);
-                if bytes.len() > MAX_PLAIN_BYTES {
-                    return Err(Error::Invalid);
-                }
-                prepared.push((kind, id, bytes));
-            }
-            for (kind, id, bytes) in prepared {
-                self.put_inner(kind, id, bytes.as_slice(), None).await?;
-            }
+            self.stage_states_inner(snapshots).await?;
             self.synchronize_inner().await
         })
         .await
@@ -1307,6 +1267,64 @@ impl VaultClient {
             result: self.finish_sync(result),
             history: self.observed_history(),
         })
+    }
+    /// Stage native observations under the caller's local authorization and
+    /// cancellation fence. The retained owner handles network reconciliation.
+    pub async fn stage_states(&self, snapshots: Vec<Snapshot>) -> Result<VaultView, Error> {
+        let _permit = self.admitted()?;
+        self.stage_states_inner(snapshots).await?;
+        self.update_view().await
+    }
+    async fn stage_states_inner(&self, snapshots: Vec<Snapshot>) -> Result<(), Error> {
+        if snapshots.is_empty() || snapshots.len() > 32 {
+            return Err(Error::Invalid);
+        }
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let writer = DeviceId::new(self.scope.device.clone()).map_err(dependency)?;
+        let mut targets = std::collections::BTreeSet::new();
+        let mut prepared = Vec::new();
+        for snapshot in snapshots {
+            let (kind, id) = match &snapshot.data {
+                State::Repository { .. } => return Err(Error::Invalid),
+                State::Device { .. } => (EntityKind::DeviceState, self.scope.device.clone()),
+                State::Module { module_id, .. } => (
+                    EntityKind::ModuleState,
+                    format!("{}:{module_id}", self.scope.device),
+                ),
+                // Only the explicit CAS command may change desired state.
+                State::ModuleConfiguration { .. } => return Err(Error::Invalid),
+                State::Account { .. } => (
+                    EntityKind::AccountState,
+                    format!("{}:nds", self.scope.device),
+                ),
+            };
+            snapshot
+                .validate(&writer, kind, &id)
+                .map_err(|_| Error::Invalid)?;
+            if !targets.insert((kind.as_str(), id.clone())) {
+                return Err(Error::Invalid);
+            }
+            let lookup_id = id.clone();
+            let previous = self.journal.entity(kind.as_str(), &lookup_id).await?;
+            if let Some(previous) = previous {
+                let envelope = codec::versioned(&previous.body)?;
+                let bytes = key.decrypt_versioned(&self.scope, &envelope)?;
+                if let Ok(previous) = serde_json::from_slice::<Snapshot>(&bytes)
+                    && previous.data == snapshot.data
+                {
+                    continue;
+                }
+            }
+            let bytes = Zeroizing::new(serde_json::to_vec(&snapshot).map_err(dependency)?);
+            if bytes.len() > MAX_PLAIN_BYTES {
+                return Err(Error::Invalid);
+            }
+            prepared.push((kind, id, bytes));
+        }
+        for (kind, id, bytes) in prepared {
+            self.put_inner(kind, id, bytes.as_slice(), None).await?;
+        }
+        Ok(())
     }
     pub async fn states(&self, after: String) -> Result<StatePage, Error> {
         let _permit = self.admitted()?;
@@ -1544,7 +1562,7 @@ fn key_registry(secret: &[u8]) -> Result<Vec<VaultKey>, Error> {
     Ok(keys)
 }
 
-fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
+pub(crate) fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
     let view = identity.view();
     if !view.authenticated || view.credential_revalidation_required {
         return Err(Error::Locked);

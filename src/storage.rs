@@ -577,7 +577,8 @@ impl Storage {
                 .unwrap_or_else(|error| error.into_inner())
                 .upgrade();
             tokio::task::spawn_blocking(move || {
-                let _permits = (permit, admission, replica);
+                // Close the scope lease before releasing the I/O drain barrier.
+                let _permits = (replica, permit, admission);
                 span.in_scope(|| {
                     let result = execute(&journal, command);
                     completed(event, started, &result);
@@ -695,6 +696,17 @@ impl Storage {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pub(crate) async fn drain(&self) -> Result<(), Error> {
+        let _permit = nddev_device_sync_accounts::runtime::timeout(
+            nddev_device_sync_application::replica::BATCH_DEADLINE,
+            self.io.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::Busy)?
+        .map_err(|_| Error::Unavailable)?;
+        Ok(())
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn owner_lock(&self) -> Result<Arc<std::fs::File>, Error> {
         let journal = self.journal.clone();

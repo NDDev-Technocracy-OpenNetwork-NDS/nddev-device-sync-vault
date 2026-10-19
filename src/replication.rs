@@ -19,6 +19,10 @@ use std::{
 };
 use tracing::Instrument;
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[path = "native_replication.rs"]
+pub mod native;
+
 /// Existing session/publication ownership supplied by the assembly. Starting or
 /// replacing a task must hold `publication`; it is not an authorization grant.
 pub struct ReplicaContext {

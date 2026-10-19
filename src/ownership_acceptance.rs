@@ -3,13 +3,41 @@ use super::*;
 use crate::replication::{ReplicaContext, ReplicaTask};
 use std::time::Duration;
 
+fn native_logger() -> nddev_device_sync_telemetry::Logger {
+    let logger = super::tests::fixture_logger();
+    let sdk_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        if let Some(location) = panic.location() {
+            eprintln!(
+                "Native replica acceptance failed at {}:{}",
+                location.file(),
+                location.line()
+            );
+        }
+        sdk_hook(panic);
+    }));
+    logger
+}
+
 async fn current(task: &ReplicaTask) -> VaultView {
-    let mut updates = task.updates();
+    current_updates(task.updates(), 0).await
+}
+
+async fn current_updates(
+    mut updates: tokio::sync::watch::Receiver<Option<Result<VaultView, Error>>>,
+    minimum_cursor: u64,
+) -> VaultView {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let observed = updates.borrow_and_update().clone();
             match observed {
-                Some(Ok(view)) if !view.catching_up && view.sync_error.is_empty() => return view,
+                Some(Ok(view))
+                    if !view.catching_up
+                        && view.sync_error.is_empty()
+                        && view.cursor >= minimum_cursor =>
+                {
+                    return view;
+                }
                 Some(Err(Error::Busy)) | Some(Ok(_)) | None => {}
                 Some(Err(error)) => panic!("replica failed: {}", error.code()),
             }
@@ -36,21 +64,94 @@ fn start(identity: Arc<IdentityClient>, vault: &Arc<VaultClient>) -> ReplicaTask
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[tokio::test]
+#[ignore = "requires a fresh owned --fixture-sync3 PG/SMTP fixture and isolated native credentials"]
+async fn actual_retained_runtime_survives_facade_cancellation_and_reuses_policy() {
+    use crate::replication::native::NativeReplica;
+    let mut logger = native_logger();
+    let identity = super::tests::admitted_fixture_identity().await;
+    let endpoint = identity.origin();
+    struct Owned(PathBuf);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory =
+        Owned(std::env::temp_dir().join(format!("nds-retained-runtime-{}", uuid::Uuid::new_v4())));
+    let retained = NativeReplica::attach(&identity, directory.0.clone(), None)
+        .await
+        .unwrap();
+    let before = current_updates(retained.updates().unwrap(), 0).await;
+    let policy = retained.schedule();
+    let facade = VaultClient::new(identity.clone(), directory.0.clone())
+        .await
+        .unwrap();
+    facade
+        .save_record(
+            Some("runtime-canary".into()),
+            0,
+            None,
+            "Runtime canary".into(),
+            String::new(),
+            Zeroizing::new("SYNTHETIC_RETAINED_RUNTIME_CANARY".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(facade.refresh_local().await.unwrap().pending, 1);
+    assert!(matches!(
+        facade.stage_states(Vec::new()).await,
+        Err(Error::Invalid)
+    ));
+    let observations =
+        crate::replication::device_observations(&identity, env!("CARGO_PKG_VERSION")).unwrap();
+    assert!(facade.stage_states(observations).await.unwrap().pending > 1);
+    let old_identity = Arc::downgrade(&identity);
+    identity.cancel();
+    drop(facade);
+    drop(identity);
+    assert!(old_identity.upgrade().is_none());
+    retained.wake();
+    let caught_up = current_updates(retained.updates().unwrap(), before.cursor + 1).await;
+    assert_eq!(caught_up.pending, 0);
+    // Reopening attaches to the same independent task and policy identity.
+    let reopened = Arc::new(IdentityClient::new(&endpoint).unwrap());
+    assert!(reopened.refresh().await.unwrap().authenticated);
+    reopened
+        .prepare_device("Native vault acceptance".into())
+        .await
+        .unwrap();
+    let attached = NativeReplica::attach(&reopened, directory.0.clone(), None)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&retained, &attached));
+    assert!(Arc::ptr_eq(&policy, &attached.schedule()));
+    let visible = VaultClient::new(reopened.clone(), directory.0.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        visible
+            .native_secret("runtime-canary".into())
+            .await
+            .unwrap()
+            .as_str(),
+        "SYNTHETIC_RETAINED_RUNTIME_CANARY"
+    );
+    let retried = retained.synchronize().await.unwrap();
+    assert!(retried.pending == 0 && !retried.catching_up);
+    assert!(retained.is_running());
+    NativeReplica::shutdown().await.unwrap();
+    assert!(!retained.is_running());
+    // Shutdown drains the real worker before allowing a new explicit batch.
+    assert!(!visible.synchronize().await.unwrap().catching_up);
+    logger.shutdown();
+}
+
 #[tokio::test]
 #[ignore = "requires a fresh owned --fixture-sync3 PG/SMTP fixture and isolated native credentials"]
 async fn actual_native_owner_has_fresh_followers_and_hands_off() {
-    let mut logger = super::tests::fixture_logger();
-    let sdk_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic| {
-        if let Some(location) = panic.location() {
-            eprintln!(
-                "Native replica acceptance failed at {}:{}",
-                location.file(),
-                location.line()
-            );
-        }
-        sdk_hook(panic);
-    }));
+    let mut logger = native_logger();
     let identity = super::tests::admitted_fixture_identity().await;
     struct Owned(PathBuf);
     impl Drop for Owned {

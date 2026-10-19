@@ -29,6 +29,14 @@ renew offline authority or hide pending/Unknown work. After the owner stops,
 an existing follower may acquire ownership through the same OS lock. Actual
 native workers retain both leases until completion.
 
+On Linux, macOS and Windows, `NativeReplica` retains one selected account's
+Rust identity, Vault, task, scheduling policy and telemetry delivery across
+presentation attachments. Its identity has an independent cancellation lifetime;
+reopening attaches without replacing policy. Explicit retry, logout/account
+replacement and process shutdown have separate bounded stop/drain paths.
+`stage_states` reuses observation validation and encryption under the calling
+facade's own authorization fence; the retained owner performs reconciliation.
+
 Persisted writer facts describe the negotiated format, key and observed history;
 they do not grant authorization. Recovery resumes an existing operational stage
 before claiming uploads. A complete snapshot and sufficient contiguous tail may

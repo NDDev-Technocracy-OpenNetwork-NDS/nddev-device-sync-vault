@@ -16,6 +16,9 @@ replica-admission-acceptance:
 replica-owner-acceptance:
     cargo test --locked --features development-http --lib actual_native_owner_has_fresh_followers_and_hands_off -- --ignored
 
+retained-runtime-acceptance:
+    cargo test --locked --features development-http --lib actual_retained_runtime_survives_facade_cancellation_and_reuses_policy -- --ignored
+
 # Fresh owned fixture with the server's encoded-byte page budget.
 large-page-acceptance:
     cargo test --locked --features development-http --lib actual_native_large_page_catchup_preserves_bounds_and_freshness -- --ignored
