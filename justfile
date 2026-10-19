@@ -10,6 +10,9 @@ check: browser-check
 native-acceptance:
     cargo test --locked --features development-http --lib actual_native_vault_outbox_backend_and_process_recreation -- --ignored
 
+replica-admission-acceptance:
+    cargo test --locked --features development-http --lib actual_native_replica_admission_preserves_pending_and_local_reads -- --ignored
+
 # Fresh owned fixture with the server's encoded-byte page budget.
 large-page-acceptance:
     cargo test --locked --features development-http --lib actual_native_large_page_catchup_preserves_bounds_and_freshness -- --ignored

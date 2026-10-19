@@ -1,5 +1,104 @@
 use super::checkpoint::{v3_raw, valid_legacy_record_body};
 use super::*;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn replica_lock_excludes_other_handles_and_processes_without_locking_keys() {
+    const CHILD: &str = "NDS_TEST_REPLICA_LOCK_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let journal = Journal::open(path.into()).unwrap();
+        assert!(matches!(journal.replica_lock(), Err(Error::Busy)));
+        let _key = journal.key_lock().unwrap();
+        return;
+    }
+    let (owned, journal, _) = owned_journal();
+    let lease = journal.replica_lock().unwrap();
+    let other = Journal::open(owned.0.join("replica.db")).unwrap();
+    assert!(matches!(other.replica_lock(), Err(Error::Busy)));
+    let (_unrelated_owned, unrelated, _) = owned_journal();
+    let _unrelated = unrelated.replica_lock().unwrap();
+    assert!(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "journal::tests::io::replica_lock_excludes_other_handles_and_processes_without_locking_keys"])
+            .env(CHILD, owned.0.join("replica.db"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    drop(lease);
+    let _next = other.replica_lock().unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn replica_lock_is_released_after_process_termination() {
+    use std::{process::Command, time::Instant};
+    const CHILD: &str = "NDS_TEST_REPLICA_OWNER_CHILD";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let journal = Journal::open(path.into()).unwrap();
+        let _lease = journal.replica_lock().unwrap();
+        std::fs::write(journal.path.with_extension("ready"), []).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let (owned, journal, _) = owned_journal();
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "journal::tests::io::replica_lock_is_released_after_process_termination",
+            ])
+            .env(CHILD, owned.0.join("replica.db"))
+            .spawn()
+            .unwrap(),
+    );
+    let started = Instant::now();
+    while !journal.path.with_extension("ready").exists() {
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(journal.replica_lock(), Err(Error::Busy)));
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let _lease = journal.replica_lock().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn replica_lock_rejects_symlinks_and_distinguishes_io_failure_from_contention() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let (owned, journal, _) = owned_journal();
+    let target = owned.0.join("unrelated");
+    std::fs::write(&target, b"preserved").unwrap();
+    let permissions = std::fs::metadata(&target).unwrap().permissions().mode();
+    let lock = journal.path.with_extension("replica-lock");
+    symlink(&target, &lock).unwrap();
+    assert!(matches!(journal.replica_lock(), Err(Error::Unavailable)));
+    assert_eq!(std::fs::read(&target).unwrap(), b"preserved");
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode(),
+        permissions
+    );
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    assert!(matches!(journal.replica_lock(), Err(Error::Unavailable)));
+    std::fs::remove_dir(&lock).unwrap();
+    let _lease = journal.replica_lock().unwrap();
+    assert_eq!(
+        std::fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 fn original_result(id: &str, revision: i64, seq: i64) -> Vec<u8> {
     serde_json::to_vec_pretty(&applied(id, revision, seq)).unwrap()
 }
