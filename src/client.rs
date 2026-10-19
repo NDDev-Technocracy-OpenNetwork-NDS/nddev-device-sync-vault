@@ -1010,6 +1010,8 @@ impl VaultClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let _replica = self.journal.replica_lock().await?;
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             self.prepare_identity().await?;
             let port = history_replica::Replica::new(self).await?;
@@ -1038,6 +1040,8 @@ impl VaultClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let _replica = self.journal.replica_lock().await?;
         self.view
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1091,6 +1095,8 @@ impl VaultClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let _replica = self.journal.replica_lock().await?;
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             if snapshots.is_empty()
                 || snapshots.len() > 32
@@ -1597,6 +1603,114 @@ mod tests {
             .await
             .unwrap();
         (receipt, identity)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and isolated native credentials"]
+    async fn actual_native_replica_admission_preserves_pending_and_local_reads() {
+        let mut logger =
+            nddev_device_sync_telemetry::install(nddev_device_sync_telemetry::Config {
+                service: "nds-vault-acceptance".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault".into(),
+                commit: "unknown".into(),
+                channel: "alpha".into(),
+                standards: "unreleased".into(),
+                environment: "development".into(),
+                target_prefixes: vec!["nds_accounts".into(), "nddev_device_sync_vault".into()],
+                default_module: "vault".into(),
+                debug: None,
+            })
+            .unwrap();
+        let (_receipt, identity) = fixture_identity().await;
+        // Seed only the empty fixture counter, then wait for its explicit
+        // operator admission. Never race a live writer-mode transition.
+        identity
+            .sync_request(SyncRequest::CapabilitiesV3)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let receipt: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(std::env::var("NDS_FIXTURE_RECEIPT").unwrap()).unwrap(),
+                )
+                .unwrap();
+                if receipt["new_operation_version"] == 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let owned = Owned(
+            std::env::temp_dir().join(format!("nds-replica-admission-{}", uuid::Uuid::new_v4())),
+        );
+        let vault = VaultClient::new(identity.clone(), owned.0.clone())
+            .await
+            .unwrap();
+        assert!(!vault.synchronize().await.unwrap().catching_up);
+        vault
+            .save_record(
+                Some("ownership-record".into()),
+                0,
+                None,
+                "Ownership acceptance".into(),
+                String::new(),
+                Zeroizing::new("SYNTHETIC_REPLICA_ADMISSION_CANARY".into()),
+            )
+            .await
+            .unwrap();
+        let original = vault.journal.pending().await.unwrap();
+        assert_eq!(original.len(), 1);
+        let lease = vault.journal.replica_lock().await.unwrap();
+        let other = VaultClient::new(identity.clone(), owned.0.clone())
+            .await
+            .unwrap();
+        assert!(matches!(other.synchronize().await, Err(Error::Busy)));
+        assert!(matches!(other.synchronize_inbox().await, Err(Error::Busy)));
+        assert!(matches!(
+            other.probe_capacity_attempt().await,
+            Err(Error::Busy)
+        ));
+        assert!(matches!(
+            other
+                .publish_states(
+                    crate::replication::device_observations(&identity, env!("CARGO_PKG_VERSION"),)
+                        .unwrap()
+                )
+                .await,
+            Err(Error::Busy)
+        ));
+        assert_eq!(other.refresh_local().await.unwrap().pending, 1);
+        let records = other.records(String::new()).await.unwrap();
+        assert_eq!(records.items.len(), 1);
+        assert_eq!(records.items[0].id, "ownership-record");
+        assert!(records.items[0].pending_id.is_some());
+        let retained = other.journal.pending().await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, original[0].id);
+        assert_eq!(retained[0].body, original[0].body);
+        drop(lease);
+        let completed = other.synchronize().await.unwrap();
+        assert_eq!(completed.pending, 0);
+        assert!(!completed.catching_up);
+        assert_eq!(
+            other
+                .native_secret("ownership-record".into())
+                .await
+                .unwrap()
+                .as_str(),
+            "SYNTHETIC_REPLICA_ADMISSION_CANARY"
+        );
+        logger.shutdown();
     }
 
     #[tokio::test]

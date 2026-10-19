@@ -12,6 +12,14 @@ verification and whole journal transactions; it retains cryptography, key
 provisioning and SQLite/OPFS execution. Transport DTOs come from Accounts,
 generated from its immutable Protocol source pin.
 
+Native synchronization, inbox reads, state publication and capacity probes share
+one OS lease per canonical journal. Another process receives `Busy` before
+network or outbox work begins; local reads and edits remain available. Native
+SQLite workers retain that lease through actual completion after caller
+cancellation. The separate key-provisioning lock remains independent. Admission
+is per batch; retaining a background owner across GUI/CLI attachments is an
+assembly responsibility.
+
 Persisted writer facts describe the negotiated format, key and observed history;
 they do not grant authorization. Recovery resumes an existing operational stage
 before claiming uploads. A complete snapshot and sufficient contiguous tail may
@@ -24,7 +32,8 @@ Its Rust result distinguishes `inbox_at_head` from full freshness: pending work
 still prevents `caught_up` and `last_sync_at` advancement. The caller retains
 the core upload-capacity block and presents it independently of the current
 read result. Successful reads clear read errors, not upload eligibility; real
-read failures remain typed and observable. No second scheduler lives in Vault.
+read failures remain typed and observable. Core owns scheduling decisions;
+Vault's shared replica task executes that policy.
 
 `probe_capacity_attempt` executes Core's bounded one-original check through the same
 signed append and durable acknowledgement/Unknown path. Its distinct storage
@@ -76,6 +85,11 @@ publication receipt, so later metadata cannot relabel an earlier result.
 NDS permission consent does not grant OS/browser access or prove provider readiness.
 
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
+
+`just replica-admission-acceptance` uses a fresh `--fixture-sync3` fixture and
+isolated native credentials. It checks every replica entry, preserves the exact
+encrypted pending original and local record reads under contention, then
+qualifies real replay after the lease is released.
 
 `just catalog-acceptance` uses a fresh server fixture started with `--fixture-sync3`.
 It sends generated facts for 1024 repositories through real HTTP/PostgreSQL,
