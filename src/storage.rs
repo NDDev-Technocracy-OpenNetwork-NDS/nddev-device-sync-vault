@@ -223,10 +223,10 @@ impl Command {
         }
     }
 }
-fn completed(
+fn completed<T>(
     event: &'static str,
     started: nddev_device_sync_accounts::runtime::Instant,
-    result: &Result<Reply, Error>,
+    result: &Result<T, Error>,
 ) {
     match result {
         Ok(_) => {
@@ -483,6 +483,8 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
 pub(crate) struct Storage {
     #[cfg(not(target_arch = "wasm32"))]
     journal: Journal,
+    #[cfg(not(target_arch = "wasm32"))]
+    replica: std::sync::Mutex<std::sync::Weak<std::fs::File>>,
     #[cfg(target_arch = "wasm32")]
     scope: String,
     io: Arc<Semaphore>,
@@ -497,6 +499,7 @@ impl Storage {
                 .map_err(|_| Error::Unavailable)??;
             Ok(Self {
                 journal,
+                replica: Default::default(),
                 io: Arc::new(Semaphore::new(1)),
                 admission: Arc::new(Semaphore::new(4)),
             })
@@ -545,7 +548,7 @@ impl Storage {
         )
         .await;
         if let Err(error) = check() {
-            span.in_scope(|| completed(event, started, &Err(error)));
+            span.in_scope(|| completed::<Reply>(event, started, &Err(error)));
             return Err(error);
         }
         let permit = permit
@@ -554,8 +557,15 @@ impl Storage {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let journal = self.journal.clone();
+            // Aborting the waiting async batch cannot abort spawn_blocking.
+            // Retain its exact scope lease until this worker really returns.
+            let replica = self
+                .replica
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .upgrade();
             tokio::task::spawn_blocking(move || {
-                let _permits = (permit, admission);
+                let _permits = (permit, admission, replica);
                 span.in_scope(|| {
                     let result = execute(&journal, command);
                     completed(event, started, &result);
@@ -674,6 +684,29 @@ impl Storage {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn replica_lock(&self) -> Result<Arc<std::fs::File>, Error> {
+        let journal = self.journal.clone();
+        let span = nddev_device_sync_telemetry::operation_span("vault", "io")
+            .map_err(|_| Error::Unavailable)?;
+        let started = nddev_device_sync_accounts::runtime::Instant::now();
+        let lease = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                span.in_scope(|| {
+                    let result = journal.replica_lock();
+                    completed("vault.replica.admission", started, &result);
+                    result
+                })
+            })
+            .await
+            .map_err(|_| Error::Unavailable)??,
+        );
+        *self
+            .replica
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&lease);
+        Ok(lease)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn key_lock(&self) -> Result<std::fs::File, Error> {
         let journal = self.journal.clone();
         tokio::task::spawn_blocking(move || journal.key_lock())
@@ -694,6 +727,53 @@ impl Storage {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod admission_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_replica_retains_its_lease_until_actual_sqlite_completion() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let owned =
+            Owned(std::env::temp_dir().join(format!("nds-replica-lease-{}", uuid::Uuid::new_v4())));
+        let path = owned.0.join("replica.db");
+        let storage = Arc::new(Storage::open(path.clone()).await.unwrap());
+        let contender = Journal::open(path.clone()).unwrap();
+        // Real SQLite writer exclusion, independent of the async caller.
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let lease = storage.replica_lock().await.unwrap();
+        let observed = Arc::downgrade(&lease);
+        let batch = storage.clone();
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            batch.call(Command::CaughtUp { cursor: 0, at: 77 }).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while observed.strong_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(matches!(contender.replica_lock(), Err(Error::Busy)));
+        connection.execute_batch("ROLLBACK;").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while observed.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _next = contender.replica_lock().unwrap();
+        assert_eq!(contender.stats().unwrap().3, 77);
+        assert_eq!(storage.io.available_permits(), 1);
+        assert_eq!(storage.admission.available_permits(), 4);
+    }
 
     #[tokio::test]
     async fn cancelled_guard_after_queue_wait_cannot_start_a_transaction() {

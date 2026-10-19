@@ -233,6 +233,16 @@ impl Journal {
     /// app processes too; an in-process semaphore alone cannot protect a key.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn key_lock(&self) -> Result<File, Error> {
+        self.lock("key-lock")
+    }
+    /// Separate from key provisioning: every native replica batch for this
+    /// durable scope must retain this lease through its actual storage I/O.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn replica_lock(&self) -> Result<File, Error> {
+        self.lock("replica-lock")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lock(&self, extension: &str) -> Result<File, Error> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -243,12 +253,21 @@ impl Journal {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let file = options
-            .open(self.path.with_extension("key-lock"))
+            .open(self.path.with_extension(extension))
             .map_err(failed)?;
         if !file.metadata().map_err(failed)?.file_type().is_file() {
             return Err(Error::Invalid);
         }
-        file.try_lock().map_err(|_| Error::Busy)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(failed)?;
+        }
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => Error::Busy,
+            std::fs::TryLockError::Error(_) => Error::Unavailable,
+        })?;
         Ok(file)
     }
 }
