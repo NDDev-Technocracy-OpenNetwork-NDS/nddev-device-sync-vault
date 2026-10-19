@@ -114,6 +114,11 @@ pending-state freshness, native secret use and ownership handoff. This qualifies
 the Rust task boundary; GUI attachment retention and CLI assembly require their
 own integration checks.
 
+`just retained-runtime-acceptance` also disposes a manual retry's caller after
+admission. The retained runtime owns that bounded operation and its restart;
+discarding the reply cannot stop automatic synchronization. Explicit shutdown
+cancels the retained authority and drains the same operation before completion.
+
 `just catalog-acceptance` uses a fresh server fixture started with `--fixture-sync3`.
 It sends generated facts for 1024 repositories through real HTTP/PostgreSQL,
 checks unchanged and changed observations in a second SQLite replica, then
