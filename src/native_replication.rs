@@ -7,6 +7,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
+use tracing::Instrument;
 
 // A process serves one selected native account/endpoint. Changing that selection
 // drains the previous owner before starting another; reopening reuses it.
@@ -22,8 +23,9 @@ pub struct NativeReplica {
     publication: Arc<Mutex<()>>,
     policy: Arc<Mutex<Arc<Mutex<ReplicaSchedule>>>>,
     task: Mutex<Option<ReplicaTask>>,
-    control: tokio::sync::Mutex<()>,
+    control: Arc<tokio::sync::Mutex<()>>,
     stopping: AtomicBool,
+    stopped: AtomicBool,
     client_version: Option<String>,
     delivery: Mutex<Option<nddev_device_sync_accounts::telemetry::Delivery>>,
 }
@@ -104,8 +106,9 @@ impl NativeReplica {
             publication: Arc::default(),
             policy: Arc::default(),
             task: Mutex::default(),
-            control: tokio::sync::Mutex::default(),
+            control: Arc::default(),
             stopping: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             client_version,
             delivery: Mutex::default(),
         });
@@ -244,40 +247,58 @@ impl NativeReplica {
     }
     /// Explicit manual retry owns policy replacement. Reopening/foregrounding
     /// only attaches or wakes and never clears a capacity refusal.
-    pub async fn synchronize(&self) -> Result<VaultView, Error> {
-        let _control = self.control.try_lock().map_err(|_| Error::Busy)?;
+    pub async fn synchronize(self: &Arc<Self>) -> Result<VaultView, Error> {
+        // Admit one owned operation before spawning it. Dropping a presentation
+        // caller discards only its reply, not restart/drain responsibility.
+        let control = self
+            .control
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Error::Busy)?;
+        let owner = self.clone();
+        tokio::spawn(
+            async move {
+                let _control = control;
+                owner.synchronize_inner().await
+            }
+            .in_current_span(),
+        )
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+    async fn synchronize_inner(&self) -> Result<VaultView, Error> {
         if self.stopping.load(Ordering::Acquire) {
             return Err(Error::Locked);
         }
         let lifetime = self.identity.local_use_lifetime();
-        self.stop_task().await?;
-        let fence = self
-            .identity
-            .local_use_fence_from(&lifetime)
-            .await
-            .map_err(replica_auth_error)?;
-        let schedule = Arc::new(Mutex::new(ReplicaSchedule::default()));
-        {
-            let _publication = self
-                .publication
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            self.identity
-                .check_local_use_lifetime(&fence)
+        let mut history = None;
+        let result = async {
+            self.stop_task().await?;
+            let fence = self
+                .identity
+                .local_use_fence_from(&lifetime)
+                .await
                 .map_err(replica_auth_error)?;
-            *self
-                .policy
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = schedule.clone();
+            let schedule = Arc::new(Mutex::new(ReplicaSchedule::default()));
+            {
+                let _publication = self
+                    .publication
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                self.identity
+                    .check_local_use_lifetime(&fence)
+                    .map_err(replica_auth_error)?;
+                *self
+                    .policy
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = schedule;
+            }
+            let attempt = self.vault.retry_synchronize_attempt().await?;
+            history = attempt.history;
+            attempt.result.map(|progress| progress.view)
         }
-        let attempt = self.vault.retry_synchronize_attempt().await;
-        let (result, history) = match attempt {
-            Ok(attempt) => (
-                attempt.result.map(|progress| progress.view),
-                attempt.history,
-            ),
-            Err(error) => (Err(error), None),
-        };
+        .await;
+        let schedule = self.schedule();
         let next = {
             let mut policy = schedule.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(history) = history {
@@ -302,17 +323,12 @@ impl NativeReplica {
         )
         .await
         .map_err(|_| Error::Busy)?;
-        let owned_task = self
-            .task
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_some();
         self.stop_task().await?;
         self.delivery
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        if owned_task {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
             tracing::info!(
                 event.name = "sync.runtime.stopped",
                 module = "vault",

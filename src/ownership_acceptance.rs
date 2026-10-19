@@ -301,6 +301,30 @@ async fn actual_retained_runtime_survives_facade_cancellation_and_reuses_policy(
     let retried = retained.synchronize().await.unwrap();
     assert!(retried.pending == 0 && !retried.catching_up);
     assert!(retained.is_running());
+    let mut previous = retained.updates().unwrap();
+    // Poll the ordinary manual API once, then dispose only its caller. No
+    // credential delay, private fault hook or replacement attachment is used.
+    let mut retry = Box::pin(retained.synchronize());
+    let pending = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(retry.as_mut(), context).is_pending())
+    })
+    .await;
+    assert!(pending, "actual manual I/O must have an outstanding future");
+    drop(retry);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while previous.changed().await.is_ok() {
+            previous.borrow_and_update();
+        }
+        loop {
+            if let Ok(updates) = retained.updates() {
+                break current_updates(updates, caught_up.cursor).await;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("discarding a manual caller must not stop its retained runtime");
+    assert!(retained.is_running());
     NativeReplica::shutdown().await.unwrap();
     assert!(!retained.is_running());
     // Shutdown drains the real worker before allowing a new explicit batch.
