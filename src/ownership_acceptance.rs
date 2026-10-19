@@ -24,10 +24,18 @@ async fn current(task: &ReplicaTask) -> VaultView {
 }
 
 async fn current_updates(
-    mut updates: tokio::sync::watch::Receiver<Option<Result<VaultView, Error>>>,
+    updates: tokio::sync::watch::Receiver<Option<Result<VaultView, Error>>>,
     minimum_cursor: u64,
 ) -> VaultView {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    current_updates_for(updates, minimum_cursor, Duration::from_secs(30)).await
+}
+
+async fn current_updates_for(
+    mut updates: tokio::sync::watch::Receiver<Option<Result<VaultView, Error>>>,
+    minimum_cursor: u64,
+    deadline: Duration,
+) -> VaultView {
+    tokio::time::timeout(deadline, async {
         loop {
             let observed = updates.borrow_and_update().clone();
             match observed {
@@ -48,20 +56,172 @@ async fn current_updates(
     .unwrap()
 }
 
+type Policy = Arc<Mutex<Arc<Mutex<nddev_device_sync_application::lifecycle::ReplicaSchedule>>>>;
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[tokio::test]
+#[ignore = "fills the production entity quota through real HTTP; fresh owned PG/SMTP/native credentials required"]
+async fn actual_capacity_refusal_survives_owner_handoff_without_original_rewrite() {
+    use nddev_device_sync_domain::sync::MAX_ENTITY_COUNT;
+    let mut logger = native_logger();
+    let identity = super::tests::admitted_fixture_identity().await;
+    struct Owned(PathBuf);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory =
+        Owned(std::env::temp_dir().join(format!("nds-owner-capacity-{}", uuid::Uuid::new_v4())));
+    let owner = Arc::new(
+        VaultClient::new(identity.clone(), directory.0.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(!owner.synchronize().await.unwrap().catching_up);
+    let mut primary = start(identity.clone(), &owner);
+    current(&primary).await;
+    // The production per-device replay cache retains at most 512 live
+    // signature nonces. Loading 4096 entities must honor its expiry/backoff;
+    // this fixture budget does not alter any product quota or batch deadline.
+    tokio::time::timeout(Duration::from_secs(3300), async {
+        for index in 0..MAX_ENTITY_COUNT {
+            owner
+                .save_record(
+                    Some(format!("capacity-{index}")),
+                    0,
+                    None,
+                    "Capacity seed".into(),
+                    String::new(),
+                    Zeroizing::new("SYNTHETIC_CAPACITY_VALUE".into()),
+                )
+                .await
+                .unwrap();
+            if (index + 1) % nddev_device_sync_application::replica::MAX_UPLOADS as u64 == 0 {
+                // Use production retry/admission policy under real server pressure.
+                primary.set_active(true);
+                current_updates_for(primary.updates(), index + 1, Duration::from_secs(420)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(owner.snapshot().cursor, MAX_ENTITY_COUNT);
+    owner
+        .save_record(
+            Some("capacity-refused".into()),
+            0,
+            None,
+            "Refused original".into(),
+            String::new(),
+            Zeroizing::new("SYNTHETIC_REFUSED_ORIGINAL".into()),
+        )
+        .await
+        .unwrap();
+    let original = owner.journal.pending().await.unwrap();
+    assert_eq!(original.len(), 1);
+    let mut updates = primary.updates();
+    updates.borrow_and_update();
+    primary.set_active(true);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let value = updates.borrow_and_update().clone();
+            if matches!(value, Some(Err(Error::CapacityExhausted))) {
+                break;
+            }
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(owner.replica_snapshot().await.unwrap().capacity.is_some());
+    let other_identity = Arc::new(IdentityClient::new(&identity.origin()).unwrap());
+    other_identity.refresh().await.unwrap();
+    other_identity
+        .prepare_device("Native vault acceptance".into())
+        .await
+        .unwrap();
+    let other = Arc::new(
+        VaultClient::new(other_identity.clone(), directory.0.clone())
+            .await
+            .unwrap(),
+    );
+    let observed = other
+        .observe_replica(&other.begin_replica_observation().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(observed.view.sync_error, Error::CapacityExhausted.code());
+    assert!(!observed.caught_up);
+    let (mut follower, policy) = start_policy(other_identity, &other);
+    let mut observed = follower.updates();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let value = observed.borrow_and_update().clone();
+            if value.is_some_and(|value| {
+                value.is_ok_and(|view| view.sync_error == Error::CapacityExhausted.code())
+            }) {
+                break;
+            }
+            observed.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!follower.is_owner());
+    if let Some(task) = primary.cancel() {
+        task.join().await;
+    }
+    owner.drain_replica().await.unwrap();
+    follower.set_active(true);
+    observed.changed().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !follower.is_owner() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(policy.lock().unwrap().lock().unwrap().is_capacity_blocked());
+    if let Some(task) = follower.cancel() {
+        task.join().await;
+    }
+    other.drain_replica().await.unwrap();
+    assert_eq!(
+        other.journal.pending().await.unwrap()[0].body,
+        original[0].body
+    );
+    assert!(matches!(
+        other.retry_synchronize_attempt().await.unwrap().result,
+        Err(Error::CapacityExhausted)
+    ));
+    assert!(other.replica_snapshot().await.unwrap().capacity.is_some());
+    assert_eq!(
+        other.journal.pending().await.unwrap()[0].body,
+        original[0].body
+    );
+    assert_eq!(other.snapshot().cursor, MAX_ENTITY_COUNT);
+    logger.shutdown();
+}
+
 fn start(identity: Arc<IdentityClient>, vault: &Arc<VaultClient>) -> ReplicaTask {
-    let schedule = Arc::new(Mutex::new(Default::default()));
-    ReplicaTask::spawn(
+    start_policy(identity, vault).0
+}
+fn start_policy(identity: Arc<IdentityClient>, vault: &Arc<VaultClient>) -> (ReplicaTask, Policy) {
+    let policy = Arc::new(Mutex::new(Arc::new(Mutex::new(Default::default()))));
+    let schedule = policy.lock().unwrap().clone();
+    let task = ReplicaTask::spawn(
         ReplicaContext {
             identity,
             vault: Arc::downgrade(vault),
             publication: Arc::default(),
-            policy_slot: Arc::new(Mutex::new(schedule.clone())),
+            policy_slot: policy.clone(),
             schedule,
             client_version: None,
         },
         Duration::ZERO,
         true,
-    )
+    );
+    (task, policy)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

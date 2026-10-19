@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use std::fs::{self, File, OpenOptions};
 use std::{path::PathBuf, time::Duration};
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 fn check_version(connection: &Connection) -> Result<(), Error> {
     let version: u32 = connection
@@ -46,6 +46,8 @@ pub(crate) struct ReplicaSnapshot {
     pub writer: WriterSnapshot,
     pub last_sync_at: u64,
     pub unknown_reason: Option<String>,
+    /// Actual authenticated head/floor retained with a refused pending original.
+    pub capacity: Option<(u64, u64)>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EditTarget {
@@ -170,6 +172,7 @@ impl Journal {
                 writer: writer::read(connection)?,
                 last_sync_at,
                 unknown_reason: writer::unknown_reason(connection)?,
+                capacity: writer::capacity_refusal(connection)?,
             })
         })
     }

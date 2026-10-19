@@ -87,11 +87,8 @@ impl ReplicaTask {
                     changed = enabled.changed() => { if changed.is_err() { break; } delay = Duration::ZERO; continue; }
                     _ = runtime::sleep(delay) => {}
                 }
-                let (capacity_check, probe) = {
-                    let policy = schedule.lock().unwrap_or_else(|e| e.into_inner());
-                    (policy.capacity_check(), policy.capacity_probe())
-                };
-                let inbox_only = capacity_check.is_some() && probe.is_none();
+                let mut capacity_check = None;
+                let mut inbox_only = false;
                 let mut inbox_at_head = None;
                 let mut inbox_empty = false;
                 let mut capacity_outcome = None;
@@ -100,7 +97,7 @@ impl ReplicaTask {
                 let Some(vault) = weak.upgrade() else {
                     break;
                 };
-                let Some(result) = run_enabled(
+                let Some(mut result) = run_enabled(
                     &mut enabled,
                     observe("sync.replica.batch", async {
                         // Authority maintenance belongs to this same replica
@@ -113,6 +110,31 @@ impl ReplicaTask {
                         if ownership.is_none() {
                             match vault.replica_owner().await {
                                 Ok(lease) => {
+                                    // A new elected lifetime restores only actual journal
+                                    // refusal facts. GUI attachment/resume cannot clear them.
+                                    let restored = Arc::new(Mutex::new(
+                                        vault.restored_replica_schedule().await?,
+                                    ));
+                                    let fence = identity
+                                        .local_use_fence_from(&lifetime)
+                                        .await
+                                        .map_err(replica_auth_error)?;
+                                    {
+                                        let _publication = publication
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner());
+                                        identity
+                                            .check_local_use_lifetime(&fence)
+                                            .map_err(replica_auth_error)?;
+                                        let mut current = policy_slot
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner());
+                                        if !Arc::ptr_eq(&current, &schedule) {
+                                            return Err(VaultError::Cancelled);
+                                        }
+                                        *current = restored.clone();
+                                        schedule = restored;
+                                    }
                                     ownership = Some(lease);
                                     acquired.store(true, std::sync::atomic::Ordering::Release);
                                     tracing::info!(
@@ -140,6 +162,12 @@ impl ReplicaTask {
                                 Err(error) => return Err(error),
                             }
                         }
+                        let probe = {
+                            let policy = schedule.lock().unwrap_or_else(|error| error.into_inner());
+                            capacity_check = policy.capacity_check();
+                            policy.capacity_probe()
+                        };
+                        inbox_only = capacity_check.is_some() && probe.is_none();
                         if probe.is_some() {
                             let attempt = vault.probe_capacity_attempt().await?;
                             attempt_history = attempt.history;
@@ -240,6 +268,12 @@ impl ReplicaTask {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .after_with_sample(outcome, sample);
+                if let Ok(view) = &mut result {
+                    project_policy(
+                        view,
+                        &schedule.lock().unwrap_or_else(|error| error.into_inner()),
+                    );
+                }
                 progress.send_replace(Some(result));
                 let Some(next) = next else {
                     break;
@@ -281,6 +315,17 @@ impl ReplicaTask {
             task.abort();
         }
         task
+    }
+}
+
+/// Preserve the canonical upload refusal alongside a successful inbox read.
+/// A read cannot clear upload policy or disguise a terminal/current read error.
+pub fn project_policy(view: &mut VaultView, schedule: &ReplicaSchedule) {
+    if schedule.is_capacity_blocked() {
+        if view.sync_error.is_empty() {
+            view.sync_error = VaultError::CapacityExhausted.code();
+        }
+        view.catching_up = true;
     }
 }
 impl Drop for ReplicaTask {

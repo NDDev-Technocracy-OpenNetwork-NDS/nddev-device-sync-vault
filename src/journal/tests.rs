@@ -4,6 +4,7 @@ use nddev_device_sync_domain::{
     DeviceId,
     sync::{EncryptedPayload, EntityKind, Operation},
 };
+mod capacity;
 mod checkpoint;
 mod fence;
 mod io;
@@ -503,6 +504,8 @@ fn legacy_layout(connection: &Connection) {
         ALTER TABLE meta DROP COLUMN writer_key_id;
         ALTER TABLE meta DROP COLUMN confirmed_basis_seq;
         ALTER TABLE outbox DROP COLUMN terminal_unknown_reason;
+        ALTER TABLE outbox DROP COLUMN capacity_floor;
+        ALTER TABLE outbox DROP COLUMN capacity_head;
         ALTER TABLE entities DROP COLUMN receipt_body;
         ALTER TABLE entities DROP COLUMN receipt_status;",
         )

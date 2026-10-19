@@ -238,6 +238,12 @@ impl VaultClient {
         view.last_sync_at = last_sync_at;
         Ok(view.clone())
     }
+    pub(crate) fn begin_reconciliation(&self) {
+        self.view
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .catching_up = true;
+    }
     pub async fn refresh(&self) -> Result<VaultView, Error> {
         self.synchronize().await
     }
@@ -266,6 +272,33 @@ impl VaultClient {
             crate::storage::Reply::ReplicaSnapshot(snapshot) => Ok(snapshot),
             _ => Err(Error::Invalid),
         }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn restored_replica_schedule(
+        &self,
+    ) -> Result<nddev_device_sync_application::lifecycle::ReplicaSchedule, Error> {
+        let fence = self
+            .identity
+            .local_use_fence()
+            .await
+            .map_err(identity_failure)?;
+        let snapshot = self.replica_snapshot().await?;
+        let mut policy = nddev_device_sync_application::lifecycle::ReplicaSchedule::default();
+        if let Some((head, floor)) = snapshot.capacity {
+            let history = nddev_device_sync_domain::sync::history::HistoryVersion {
+                head,
+                floor,
+                base: floor,
+            };
+            history.validate()?;
+            policy.observe_history(history);
+            policy.after(nddev_device_sync_application::lifecycle::BatchOutcome::CapacityExhausted);
+        }
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        Ok(policy)
     }
     /// Freeze one authenticated observation for this bounded follower wait.
     /// Subsequent local polling cannot compete with the owner's HTTP admission.
@@ -367,7 +400,11 @@ impl VaultClient {
             local_revision: current.writer.local_revision,
             last_sync_at: current.last_sync_at,
             catching_up: !caught_up,
-            sync_error: unknown_reason_code(current.unknown_reason.as_deref())?.into(),
+            sync_error: if current.unknown_reason.is_none() && current.capacity.is_some() {
+                Error::CapacityExhausted.code()
+            } else {
+                unknown_reason_code(current.unknown_reason.as_deref())?.into()
+            },
             browser_persistent: None,
         };
         self.identity
@@ -1183,6 +1220,18 @@ impl VaultClient {
         &self,
         inbox_only: bool,
     ) -> Result<SyncAttempt<InboxProgress>, Error> {
+        self.synchronize_attempt_inner(inbox_only, false).await
+    }
+    /// Explicit user retry may clear only the retained refusal metadata. Exact
+    /// dispatched request bytes and terminal Unknown reasons remain unchanged.
+    pub async fn retry_synchronize_attempt(&self) -> Result<SyncAttempt<InboxProgress>, Error> {
+        self.synchronize_attempt_inner(false, true).await
+    }
+    async fn synchronize_attempt_inner(
+        &self,
+        inbox_only: bool,
+        retry: bool,
+    ) -> Result<SyncAttempt<InboxProgress>, Error> {
         self.authorized()?;
         let _permit = self
             .sync_gate
@@ -1191,12 +1240,23 @@ impl VaultClient {
             .map_err(|_| Error::Busy)?;
         #[cfg(not(target_arch = "wasm32"))]
         let _replica = self.journal.replica_lock().await?;
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .catching_up = true;
+        self.begin_reconciliation();
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             self.prepare_identity().await?;
+            if retry {
+                let fence = self
+                    .identity
+                    .local_use_fence()
+                    .await
+                    .map_err(identity_failure)?;
+                self.journal
+                    .call_guarded(crate::storage::Command::RetryCapacity, || {
+                        self.identity
+                            .check_local_use_lifetime(&fence)
+                            .map_err(identity_failure)
+                    })
+                    .await?;
+            }
             self.reconcile_inner(inbox_only).await
         })
         .await
@@ -1475,10 +1535,7 @@ impl VaultClient {
             .map(|progress| progress.view)
     }
     async fn reconcile_inner(&self, inbox_only: bool) -> Result<InboxProgress, Error> {
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .catching_up = true;
+        self.begin_reconciliation();
         let port = history_replica::Replica::new(self).await?;
         let progress = if inbox_only {
             replica::reconcile_inbox(&port).await?

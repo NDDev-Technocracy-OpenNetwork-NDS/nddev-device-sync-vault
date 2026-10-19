@@ -169,7 +169,7 @@ checks every operation field, including the device. Stop older clients/tabs
 before upgrading their shared journal; do not downgrade it. The migration does
 not restore records previously discarded by an older client.
 
-The current journal schema is 7. Its forward migration preserves original rows,
+The current journal schema is 8. Its forward migration preserves original rows,
 IDs, ciphertext, receipts, pending chains and cursors. Read-only legacy views
 prevent old bootstrap and writers from creating a parallel journal. Current
 reads and writes recheck the supported version inside their transaction;
@@ -177,6 +177,16 @@ unknown stores fail closed. Writer facts, terminal Unknown reasons and checkpoin
 staging remain in that same database. Browser commands execute the same Rust
 journal under their Web Lock. Upgrade consumers together and preserve active
 drafts while replacing old processes and tabs.
+
+An authenticated capacity refusal retains the observed history head/floor beside
+the exact dispatched original. A newly elected native owner restores Core's
+upload policy from those facts; follower reads and successful inbox reads cannot
+clear it. Explicit synchronization retries clear only this refusal metadata,
+preserving the original ciphertext, operation ID and terminal Unknown reasons.
+The schema 7 to 8 transition adds metadata without rewriting encrypted state.
+`just capacity-owner-acceptance` fills the unchanged production entity quota in
+a fresh `--fixture-sync3 --fixture-seconds 3600` fixture, then checks follower
+observation, owner handoff and explicit retry with isolated native credentials.
 
 Browser qualification must exercise the actual composition root, credentials,
 worker restart, cross-tab writes and storage eviction/quota behavior. Browser

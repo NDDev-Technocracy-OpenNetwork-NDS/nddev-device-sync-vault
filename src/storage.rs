@@ -35,6 +35,13 @@ pub(crate) enum Command {
     },
     WriterSnapshot,
     ReplicaSnapshot,
+    CapacityRefused {
+        id: String,
+        request: Vec<u8>,
+        head: u64,
+        floor: u64,
+    },
+    RetryCapacity,
     ConfirmWriter {
         expected: crate::journal::WriterSnapshot,
         mode: u8,
@@ -189,6 +196,8 @@ impl Command {
             Self::EnqueueWriter { .. } => "vault.storage.enqueue_writer",
             Self::WriterSnapshot => "vault.storage.writer_snapshot",
             Self::ReplicaSnapshot => "vault.storage.replica_snapshot",
+            Self::CapacityRefused { .. } => "vault.storage.capacity_refused",
+            Self::RetryCapacity => "vault.storage.capacity_retry",
             Self::ConfirmWriter { .. } => "vault.storage.writer_confirm",
             Self::MarkUnknown { .. } => "vault.storage.unknown",
             Self::UnknownReason => "vault.storage.unknown_reason",
@@ -325,6 +334,19 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
         )?),
         Command::WriterSnapshot => Reply::WriterSnapshot(journal.writer_snapshot()?),
         Command::ReplicaSnapshot => Reply::ReplicaSnapshot(journal.replica_snapshot()?),
+        Command::CapacityRefused {
+            id,
+            request,
+            head,
+            floor,
+        } => {
+            journal.capacity_refused(&id, &request, head, floor)?;
+            Reply::Done
+        }
+        Command::RetryCapacity => {
+            journal.retry_capacity()?;
+            Reply::Done
+        }
         Command::ConfirmWriter {
             expected,
             mode,

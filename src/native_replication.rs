@@ -85,6 +85,8 @@ impl NativeReplica {
             return Err(Error::Locked);
         }
         let vault = Arc::new(VaultClient::new(identity.clone(), directory.clone()).await?);
+        // A newly started executor has not yet observed the current remote head.
+        vault.begin_reconciliation();
         let authority = identity
             .local_use_fence()
             .await
@@ -186,7 +188,14 @@ impl NativeReplica {
             .validate_local_use(&self.authority)
             .await
             .map_err(replica_auth_error)?;
-        let view = self.vault.refresh_local().await?;
+        let mut view = self.vault.refresh_local().await?;
+        project_policy(
+            &mut view,
+            &self
+                .schedule()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
         self.identity
             .validate_local_use(&self.authority)
             .await
@@ -261,7 +270,7 @@ impl NativeReplica {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = schedule.clone();
         }
-        let attempt = self.vault.synchronize_attempt(false).await;
+        let attempt = self.vault.retry_synchronize_attempt().await;
         let (result, history) = match attempt {
             Ok(attempt) => (
                 attempt.result.map(|progress| progress.view),

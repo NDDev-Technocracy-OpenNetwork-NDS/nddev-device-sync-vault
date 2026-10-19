@@ -383,7 +383,35 @@ impl ReplicaPort for Replica<'_> {
             OperationVersion::V2 => SyncRequest::Append(pending.body.clone()),
             OperationVersion::V3 { .. } => SyncRequest::AppendV3(pending.body.clone()),
         };
-        let reply = self.request(request).await?;
+        let reply = match self.request(request).await {
+            Err(Error::CapacityExhausted) => {
+                // Keep the exact original and the actual observed history, so
+                // another process/restarted owner retains this same refusal.
+                let history = self.client.observed_history();
+                if let Some(history) = history {
+                    self.validate().await?;
+                    self.client
+                        .journal
+                        .call_guarded(
+                            Command::CapacityRefused {
+                                id: pending.id.clone(),
+                                request: pending.body.clone(),
+                                head: history.head,
+                                floor: history.floor,
+                            },
+                            || {
+                                self.client
+                                    .identity
+                                    .check_local_use_lifetime(&self.fence)
+                                    .map_err(identity_failure)
+                            },
+                        )
+                        .await?;
+                }
+                return Err(Error::CapacityExhausted);
+            }
+            result => result?,
+        };
         if let Some(expiry) = reply.expiry().map_err(identity_failure)? {
             let reason = match expiry {
                 SyncExpiry::V2CursorExpired => UnknownReason::LegacyMissing,
