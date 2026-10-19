@@ -20,6 +20,23 @@ cancellation. The separate key-provisioning lock remains independent. Admission
 is per batch; retaining a background owner across GUI/CLI attachments is an
 assembly responsibility.
 
+The native `ReplicaTask` retains a separate owner lease between batches. A
+second task follows that owner using one authenticated history observation and
+atomic journal snapshots under its original protected authorization fence. It
+polls local progress while waiting, rather than competing for HTTP admission on
+every poll. The observation expires within Core's batch deadline; it cannot
+renew offline authority or hide pending/Unknown work. After the owner stops,
+an existing follower may acquire ownership through the same OS lock. Actual
+native workers retain both leases until completion.
+
+On Linux, macOS and Windows, `NativeReplica` retains one selected account's
+Rust identity, Vault, task, scheduling policy and telemetry delivery across
+presentation attachments. Its identity has an independent cancellation lifetime;
+reopening attaches without replacing policy. Explicit retry, logout/account
+replacement and process shutdown have separate bounded stop/drain paths.
+`stage_states` reuses observation validation and encryption under the calling
+facade's own authorization fence; the retained owner performs reconciliation.
+
 Persisted writer facts describe the negotiated format, key and observed history;
 they do not grant authorization. Recovery resumes an existing operational stage
 before claiming uploads. A complete snapshot and sufficient contiguous tail may
@@ -91,6 +108,12 @@ isolated native credentials. It checks every replica entry, preserves the exact
 encrypted pending original and local record reads under contention, then
 qualifies real replay after the lease is released.
 
+`just replica-owner-acceptance` uses a separate fresh fixture and isolated native
+credentials. It exercises independent owner/follower clients, actual head and
+pending-state freshness, native secret use and ownership handoff. This qualifies
+the Rust task boundary; GUI attachment retention and CLI assembly require their
+own integration checks.
+
 `just catalog-acceptance` uses a fresh server fixture started with `--fixture-sync3`.
 It sends generated facts for 1024 repositories through real HTTP/PostgreSQL,
 checks unchanged and changed observations in a second SQLite replica, then
@@ -146,7 +169,7 @@ checks every operation field, including the device. Stop older clients/tabs
 before upgrading their shared journal; do not downgrade it. The migration does
 not restore records previously discarded by an older client.
 
-The current journal schema is 7. Its forward migration preserves original rows,
+The current journal schema is 8. Its forward migration preserves original rows,
 IDs, ciphertext, receipts, pending chains and cursors. Read-only legacy views
 prevent old bootstrap and writers from creating a parallel journal. Current
 reads and writes recheck the supported version inside their transaction;
@@ -154,6 +177,16 @@ unknown stores fail closed. Writer facts, terminal Unknown reasons and checkpoin
 staging remain in that same database. Browser commands execute the same Rust
 journal under their Web Lock. Upgrade consumers together and preserve active
 drafts while replacing old processes and tabs.
+
+An authenticated capacity refusal retains the observed history head/floor beside
+the exact dispatched original. A newly elected native owner restores Core's
+upload policy from those facts; follower reads and successful inbox reads cannot
+clear it. Explicit synchronization retries clear only this refusal metadata,
+preserving the original ciphertext, operation ID and terminal Unknown reasons.
+The schema 7 to 8 transition adds metadata without rewriting encrypted state.
+`just capacity-owner-acceptance` fills the unchanged production entity quota in
+a fresh `--fixture-sync3 --fixture-seconds 3600` fixture, then checks follower
+observation, owner handoff and explicit retry with isolated native credentials.
 
 Browser qualification must exercise the actual composition root, credentials,
 worker restart, cross-tab writes and storage eviction/quota behavior. Browser

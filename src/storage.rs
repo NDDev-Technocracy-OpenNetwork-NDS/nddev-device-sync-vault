@@ -34,6 +34,14 @@ pub(crate) enum Command {
         writer: crate::journal::WriterEnqueueGuard,
     },
     WriterSnapshot,
+    ReplicaSnapshot,
+    CapacityRefused {
+        id: String,
+        request: Vec<u8>,
+        head: u64,
+        floor: u64,
+    },
+    RetryCapacity,
     ConfirmWriter {
         expected: crate::journal::WriterSnapshot,
         mode: u8,
@@ -187,6 +195,9 @@ impl Command {
             Self::CheckpointHandle { .. } => "vault.storage.checkpoint_handle",
             Self::EnqueueWriter { .. } => "vault.storage.enqueue_writer",
             Self::WriterSnapshot => "vault.storage.writer_snapshot",
+            Self::ReplicaSnapshot => "vault.storage.replica_snapshot",
+            Self::CapacityRefused { .. } => "vault.storage.capacity_refused",
+            Self::RetryCapacity => "vault.storage.capacity_retry",
             Self::ConfirmWriter { .. } => "vault.storage.writer_confirm",
             Self::MarkUnknown { .. } => "vault.storage.unknown",
             Self::UnknownReason => "vault.storage.unknown_reason",
@@ -245,6 +256,7 @@ pub(crate) enum Reply {
     VersionedEntity(Option<Entity>, u64),
     EditTarget(crate::journal::EditTarget),
     WriterSnapshot(crate::journal::WriterSnapshot),
+    ReplicaSnapshot(crate::journal::ReplicaSnapshot),
     UnknownReason(Option<String>),
     CheckpointProgress(crate::journal::StageProgress),
     Stage(crate::journal::StageGuard),
@@ -321,6 +333,20 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
             &writer,
         )?),
         Command::WriterSnapshot => Reply::WriterSnapshot(journal.writer_snapshot()?),
+        Command::ReplicaSnapshot => Reply::ReplicaSnapshot(journal.replica_snapshot()?),
+        Command::CapacityRefused {
+            id,
+            request,
+            head,
+            floor,
+        } => {
+            journal.capacity_refused(&id, &request, head, floor)?;
+            Reply::Done
+        }
+        Command::RetryCapacity => {
+            journal.retry_capacity()?;
+            Reply::Done
+        }
         Command::ConfirmWriter {
             expected,
             mode,
@@ -484,11 +510,18 @@ pub(crate) struct Storage {
     #[cfg(not(target_arch = "wasm32"))]
     journal: Journal,
     #[cfg(not(target_arch = "wasm32"))]
-    replica: std::sync::Mutex<std::sync::Weak<std::fs::File>>,
+    replica: std::sync::Mutex<std::sync::Weak<ReplicaLease>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    owner: std::sync::Mutex<std::sync::Weak<std::fs::File>>,
     #[cfg(target_arch = "wasm32")]
     scope: String,
     io: Arc<Semaphore>,
     admission: Arc<Semaphore>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ReplicaLease {
+    _batch: std::fs::File,
+    _owner: Arc<std::fs::File>,
 }
 impl Storage {
     pub async fn open(path: PathBuf) -> Result<Self, Error> {
@@ -500,6 +533,7 @@ impl Storage {
             Ok(Self {
                 journal,
                 replica: Default::default(),
+                owner: Default::default(),
                 io: Arc::new(Semaphore::new(1)),
                 admission: Arc::new(Semaphore::new(4)),
             })
@@ -565,7 +599,8 @@ impl Storage {
                 .unwrap_or_else(|error| error.into_inner())
                 .upgrade();
             tokio::task::spawn_blocking(move || {
-                let _permits = (permit, admission, replica);
+                // Close the scope lease before releasing the I/O drain barrier.
+                let _permits = (replica, permit, admission);
                 span.in_scope(|| {
                     let result = execute(&journal, command);
                     completed(event, started, &result);
@@ -683,16 +718,52 @@ impl Storage {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pub(crate) async fn drain(&self) -> Result<(), Error> {
+        let _permit = nddev_device_sync_accounts::runtime::timeout(
+            nddev_device_sync_application::replica::BATCH_DEADLINE,
+            self.io.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::Busy)?
+        .map_err(|_| Error::Unavailable)?;
+        Ok(())
+    }
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn replica_lock(&self) -> Result<Arc<std::fs::File>, Error> {
+    pub(crate) async fn owner_lock(&self) -> Result<Arc<std::fs::File>, Error> {
         let journal = self.journal.clone();
+        let lease = Arc::new(
+            tokio::task::spawn_blocking(move || journal.owner_lock())
+                .await
+                .map_err(|_| Error::Unavailable)??,
+        );
+        *self.owner.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&lease);
+        Ok(lease)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn replica_lock(&self) -> Result<Arc<ReplicaLease>, Error> {
+        let journal = self.journal.clone();
+        let owner = self
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
         let span = nddev_device_sync_telemetry::operation_span("vault", "io")
             .map_err(|_| Error::Unavailable)?;
         let started = nddev_device_sync_accounts::runtime::Instant::now();
         let lease = Arc::new(
             tokio::task::spawn_blocking(move || {
                 span.in_scope(|| {
-                    let result = journal.replica_lock();
+                    let result = (|| {
+                        let owner = match owner {
+                            Some(owner) => owner,
+                            None => Arc::new(journal.owner_lock()?),
+                        };
+                        Ok(ReplicaLease {
+                            _batch: journal.replica_lock()?,
+                            _owner: owner,
+                        })
+                    })();
                     completed("vault.replica.admission", started, &result);
                     result
                 })

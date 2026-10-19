@@ -7,6 +7,16 @@ impl Journal {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_failed)?;
         if object_kind(&tx, "v3_meta")?.as_deref() == Some("table") {
+            let version: u32 = tx
+                .query_row(
+                    "SELECT schema_version FROM v3_meta WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql_failed)?;
+            if version == 7 {
+                migrate_capacity(&tx)?;
+            }
             check_version(&tx)?;
             for name in [
                 "meta",
@@ -39,6 +49,10 @@ impl Journal {
                 )
                 .map_err(sql_failed)?;
             if !has_resolution {
+                return Err(Error::Invalid);
+            }
+            let capacity_columns: u32 = tx.query_row("SELECT count(*) FROM pragma_table_info('v3_outbox') WHERE name IN ('capacity_head','capacity_floor')", [], |row| row.get(0)).map_err(sql_failed)?;
+            if capacity_columns != 2 {
                 return Err(Error::Invalid);
             }
             return tx.commit().map_err(sql_failed);
@@ -224,7 +238,18 @@ fn migrate_v3(tx: &rusqlite::Transaction<'_>, inherited_legacy: bool) -> Result<
         [inherited_legacy],
     )
     .map_err(sql_failed)?;
-    Ok(())
+    migrate_capacity(tx)
+}
+
+fn migrate_capacity(tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
+    // Metadata only: encrypted originals, keys, receipts and checkpoint rows
+    // are unchanged. Older writers must refuse the new mutation boundary.
+    tx.execute_batch("ALTER TABLE v3_outbox ADD COLUMN capacity_head INTEGER;
+        ALTER TABLE v3_outbox ADD COLUMN capacity_floor INTEGER CHECK(
+            (capacity_head IS NULL AND capacity_floor IS NULL) OR
+            (capacity_head IS NOT NULL AND capacity_floor IS NOT NULL AND
+             capacity_head BETWEEN 0 AND 9007199254740991 AND capacity_floor BETWEEN 0 AND capacity_head));
+        UPDATE v3_meta SET schema_version=8 WHERE singleton=1;").map_err(sql_failed)
 }
 
 fn object_kind(connection: &Connection, name: &str) -> Result<Option<String>, Error> {

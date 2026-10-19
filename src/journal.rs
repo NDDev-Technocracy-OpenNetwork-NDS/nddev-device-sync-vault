@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use std::fs::{self, File, OpenOptions};
 use std::{path::PathBuf, time::Duration};
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 fn check_version(connection: &Connection) -> Result<(), Error> {
     let version: u32 = connection
@@ -38,6 +38,16 @@ fn transaction(
 #[derive(Clone)]
 pub struct Journal {
     path: PathBuf,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReplicaSnapshot {
+    pub pending: u32,
+    pub conflicts: u32,
+    pub writer: WriterSnapshot,
+    pub last_sync_at: u64,
+    pub unknown_reason: Option<String>,
+    /// Actual authenticated head/floor retained with a refused pending original.
+    pub capacity: Option<(u64, u64)>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EditTarget {
@@ -153,6 +163,19 @@ fn sql_failed(error: rusqlite::Error) -> Error {
 }
 
 impl Journal {
+    pub(crate) fn replica_snapshot(&self) -> Result<ReplicaSnapshot, Error> {
+        self.read(|connection| {
+            let (pending, conflicts, _, last_sync_at, _) = reads::stats(connection)?;
+            Ok(ReplicaSnapshot {
+                pending,
+                conflicts,
+                writer: writer::read(connection)?,
+                last_sync_at,
+                unknown_reason: writer::unknown_reason(connection)?,
+                capacity: writer::capacity_refusal(connection)?,
+            })
+        })
+    }
     #[cfg(test)]
     pub fn path_for_acceptance(&self) -> PathBuf {
         self.path.clone()
@@ -240,6 +263,10 @@ impl Journal {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn replica_lock(&self) -> Result<File, Error> {
         self.lock("replica-lock")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn owner_lock(&self) -> Result<File, Error> {
+        self.lock("replica-owner-lock")
     }
     #[cfg(not(target_arch = "wasm32"))]
     fn lock(&self, extension: &str) -> Result<File, Error> {
