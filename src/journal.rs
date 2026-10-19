@@ -40,6 +40,14 @@ pub struct Journal {
     path: PathBuf,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReplicaSnapshot {
+    pub pending: u32,
+    pub conflicts: u32,
+    pub writer: WriterSnapshot,
+    pub last_sync_at: u64,
+    pub unknown_reason: Option<String>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EditTarget {
     pub entity: Option<Entity>,
     pub committed: Option<Vec<u8>>,
@@ -153,6 +161,18 @@ fn sql_failed(error: rusqlite::Error) -> Error {
 }
 
 impl Journal {
+    pub(crate) fn replica_snapshot(&self) -> Result<ReplicaSnapshot, Error> {
+        self.read(|connection| {
+            let (pending, conflicts, _, last_sync_at, _) = reads::stats(connection)?;
+            Ok(ReplicaSnapshot {
+                pending,
+                conflicts,
+                writer: writer::read(connection)?,
+                last_sync_at,
+                unknown_reason: writer::unknown_reason(connection)?,
+            })
+        })
+    }
     #[cfg(test)]
     pub fn path_for_acceptance(&self) -> PathBuf {
         self.path.clone()
@@ -240,6 +260,10 @@ impl Journal {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn replica_lock(&self) -> Result<File, Error> {
         self.lock("replica-lock")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn owner_lock(&self) -> Result<File, Error> {
+        self.lock("replica-owner-lock")
     }
     #[cfg(not(target_arch = "wasm32"))]
     fn lock(&self, extension: &str) -> Result<File, Error> {

@@ -41,6 +41,8 @@ pub struct ReplicaTask {
     active: tokio::sync::watch::Sender<Activity>,
     task: Option<runtime::Task>,
     updates: tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    owner: Arc<std::sync::atomic::AtomicBool>,
 }
 impl ReplicaTask {
     pub fn spawn(context: ReplicaContext, initial_delay: Duration, active: bool) -> Self {
@@ -57,10 +59,18 @@ impl ReplicaTask {
             interruption: Arc::new(()),
         });
         let (progress, updates) = tokio::sync::watch::channel(None);
+        #[cfg(not(target_arch = "wasm32"))]
+        let owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(not(target_arch = "wasm32"))]
+        let acquired = owner.clone();
         let task = runtime::spawn(async move {
             let mut schedule = schedule;
             let mut delay = initial_delay;
             let mut published = client_version.is_none();
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut ownership = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut observation: Option<crate::client::ReplicaObservation> = None;
             loop {
                 if !enabled.borrow().active {
                     if enabled.changed().await.is_err() {
@@ -95,6 +105,37 @@ impl ReplicaTask {
                             .maintain_authorization()
                             .await
                             .map_err(replica_auth_error)?;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if ownership.is_none() {
+                            match vault.replica_owner().await {
+                                Ok(lease) => {
+                                    ownership = Some(lease);
+                                    acquired.store(true, std::sync::atomic::Ordering::Release);
+                                    tracing::info!(
+                                        event.name = "sync.replica.owner",
+                                        module = "vault",
+                                        outcome = "ok"
+                                    );
+                                }
+                                Err(VaultError::Busy) => {
+                                    if observation.as_ref().is_none_or(|value| value.expired()) {
+                                        observation =
+                                            Some(vault.begin_replica_observation().await?);
+                                    }
+                                    let observed = vault
+                                        .observe_replica(
+                                            observation.as_ref().ok_or(VaultError::Invalid)?,
+                                        )
+                                        .await?;
+                                    if observed.caught_up {
+                                        observation = None;
+                                    }
+                                    inbox_at_head = Some(observed.inbox_at_head);
+                                    return Ok(observed.view);
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
                         if probe.is_some() {
                             let attempt = vault.probe_capacity_attempt().await?;
                             attempt_history = attempt.history;
@@ -206,6 +247,8 @@ impl ReplicaTask {
             active,
             task: Some(task),
             updates,
+            #[cfg(not(target_arch = "wasm32"))]
+            owner,
         }
     }
     pub fn set_active(&self, active: bool) {
@@ -216,6 +259,12 @@ impl ReplicaTask {
     }
     pub fn is_running(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+    /// This running task acquired native ownership. False after cancellation
+    /// does not assert that an outstanding native worker has finished draining.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn is_owner(&self) -> bool {
+        self.is_running() && self.owner.load(std::sync::atomic::Ordering::Acquire)
     }
     /// Latest actual completed batch; there is no unbounded notification queue.
     pub fn updates(&self) -> tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>> {

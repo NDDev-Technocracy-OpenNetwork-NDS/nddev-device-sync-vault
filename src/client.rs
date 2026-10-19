@@ -68,6 +68,21 @@ pub struct SyncAttempt<T> {
     pub result: Result<T, Error>,
     pub history: Option<nddev_device_sync_domain::sync::history::HistoryVersion>,
 }
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ReplicaObservation {
+    scope: Scope,
+    fence: nddev_device_sync_accounts::LocalUseFence,
+    before: crate::journal::WriterSnapshot,
+    history: nddev_device_sync_domain::sync::history::HistoryVersion,
+    hint: Option<String>,
+    started: nddev_device_sync_accounts::runtime::Instant,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl ReplicaObservation {
+    pub(crate) fn expired(&self) -> bool {
+        self.started.elapsed() >= replica::BATCH_DEADLINE
+    }
+}
 pub struct VaultClient {
     identity: Arc<IdentityClient>,
     scope: Scope,
@@ -231,6 +246,136 @@ impl VaultClient {
     pub async fn refresh_local(&self) -> Result<VaultView, Error> {
         let _permit = self.admitted()?;
         self.update_view().await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn replica_owner(&self) -> Result<Arc<std::fs::File>, Error> {
+        self.authorized()?;
+        self.journal.owner_lock().await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn replica_snapshot(&self) -> Result<crate::journal::ReplicaSnapshot, Error> {
+        match self
+            .journal
+            .call(crate::storage::Command::ReplicaSnapshot)
+            .await?
+        {
+            crate::storage::Reply::ReplicaSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(Error::Invalid),
+        }
+    }
+    /// Freeze one authenticated observation for this bounded follower wait.
+    /// Subsequent local polling cannot compete with the owner's HTTP admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn begin_replica_observation(&self) -> Result<ReplicaObservation, Error> {
+        use nddev_device_sync_domain::sync::history::HistoryVersion;
+        self.authorized()?;
+        let started = nddev_device_sync_accounts::runtime::Instant::now();
+        let fence = self
+            .identity
+            .local_use_fence()
+            .await
+            .map_err(identity_failure)?;
+        let before = self.replica_snapshot().await?;
+        let reply = self
+            .identity
+            .sync_request(SyncRequest::HistoryV3 {
+                after: before.writer.cursor,
+                limit: 1,
+            })
+            .await
+            .map_err(identity_failure)?;
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        let (history, hint) = match reply.expiry().map_err(identity_failure)? {
+            Some(nddev_device_sync_accounts::SyncExpiry::V3(expired)) => {
+                let floor = expired.floor_seq.try_into().map_err(|_| Error::Invalid)?;
+                (
+                    HistoryVersion {
+                        head: expired.head_seq.try_into().map_err(|_| Error::Invalid)?,
+                        floor,
+                        base: floor,
+                    },
+                    None,
+                )
+            }
+            None if reply.status == 200 => {
+                crate::key_discovery::history_observation(&reply.body, before.writer.cursor)?
+            }
+            _ => return Err(Error::Unavailable),
+        };
+        history.validate()?;
+        Ok(ReplicaObservation {
+            scope: self.scope.clone(),
+            fence,
+            before: before.writer,
+            history,
+            hint,
+            started,
+        })
+    }
+    /// Local progress under that exact protected observation. No claim, upload,
+    /// key provisioning, durable freshness write or authorization renewal.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn observe_replica(
+        &self,
+        observation: &ReplicaObservation,
+    ) -> Result<InboxProgress, Error> {
+        use nddev_device_sync_domain::sync::history::InstallVersion;
+        if observation.scope != self.scope {
+            return Err(Error::Locked);
+        }
+        if observation.expired() {
+            return Err(Error::Busy);
+        }
+        self.identity
+            .validate_local_use(&observation.fence)
+            .await
+            .map_err(identity_failure)?;
+        let version = |snapshot: &crate::journal::WriterSnapshot| InstallVersion {
+            cursor: snapshot.cursor,
+            known_committed_seq: snapshot.known_committed_seq,
+            local_revision: snapshot.local_revision,
+        };
+        let key = self.key().await?.ok_or(Error::Busy)?;
+        if observation
+            .hint
+            .as_ref()
+            .is_some_and(|hint| hint != &key.id())
+        {
+            return Err(Error::Authentication);
+        }
+        let current = self.replica_snapshot().await?;
+        let caught_up = replica::follower_caught_up(
+            version(&observation.before),
+            version(&current.writer),
+            observation.history,
+            current.pending,
+            current.unknown_reason.is_some(),
+        )?;
+        let view = VaultView {
+            unlocked: true,
+            key_id: key.id(),
+            pending: current.pending,
+            conflicts: current.conflicts,
+            cursor: current.writer.cursor,
+            local_revision: current.writer.local_revision,
+            last_sync_at: current.last_sync_at,
+            catching_up: !caught_up,
+            sync_error: unknown_reason_code(current.unknown_reason.as_deref())?.into(),
+            browser_persistent: None,
+        };
+        self.identity
+            .validate_local_use(&observation.fence)
+            .await
+            .map_err(identity_failure)?;
+        *self.view.lock().unwrap_or_else(|error| error.into_inner()) = view.clone();
+        Ok(InboxProgress {
+            inbox_at_head: view.cursor >= observation.history.head,
+            caught_up,
+            view,
+        })
     }
     async fn prepare_identity(&self) -> Result<(), Error> {
         if !self.identity.view().session_verified {
@@ -1336,18 +1481,21 @@ impl VaultClient {
             _ => return Err(Error::Invalid),
         };
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-        view.sync_error = match reason.as_deref() {
-            Some("basis_expired") => "sync_basis_expired",
-            Some("legacy_missing") => "sync_legacy_outcome_unknown",
-            None => "",
-            _ => return Err(Error::Invalid),
-        }
-        .into();
+        view.sync_error = unknown_reason_code(reason.as_deref())?.into();
         Ok(InboxProgress {
             view: view.clone(),
             inbox_at_head: progress.inbox_at_head,
             caught_up: progress.caught_up,
         })
+    }
+}
+
+fn unknown_reason_code(reason: Option<&str>) -> Result<&'static str, Error> {
+    match reason {
+        Some("basis_expired") => Ok("sync_basis_expired"),
+        Some("legacy_missing") => Ok("sync_legacy_outcome_unknown"),
+        None => Ok(""),
+        _ => Err(Error::Invalid),
     }
 }
 
@@ -1605,24 +1753,23 @@ mod tests {
         (receipt, identity)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and isolated native credentials"]
-    async fn actual_native_replica_admission_preserves_pending_and_local_reads() {
-        let mut logger =
-            nddev_device_sync_telemetry::install(nddev_device_sync_telemetry::Config {
-                service: "nds-vault-acceptance".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault".into(),
-                commit: "unknown".into(),
-                channel: "alpha".into(),
-                standards: "unreleased".into(),
-                environment: "development".into(),
-                target_prefixes: vec!["nds_accounts".into(), "nddev_device_sync_vault".into()],
-                default_module: "vault".into(),
-                debug: None,
-            })
-            .unwrap();
+    pub(super) fn fixture_logger() -> nddev_device_sync_telemetry::Logger {
+        nddev_device_sync_telemetry::install(nddev_device_sync_telemetry::Config {
+            service: "nds-vault-acceptance".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault".into(),
+            commit: "unknown".into(),
+            channel: "alpha".into(),
+            standards: "unreleased".into(),
+            environment: "development".into(),
+            target_prefixes: vec!["nds_accounts".into(), "nddev_device_sync_vault".into()],
+            default_module: "vault".into(),
+            debug: None,
+        })
+        .unwrap()
+    }
+
+    pub(super) async fn admitted_fixture_identity() -> Arc<IdentityClient> {
         let (_receipt, identity) = fixture_identity().await;
         // Seed only the empty fixture counter, then wait for its explicit
         // operator admission. Never race a live writer-mode transition.
@@ -1644,6 +1791,15 @@ mod tests {
         })
         .await
         .unwrap();
+        identity
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and isolated native credentials"]
+    async fn actual_native_replica_admission_preserves_pending_and_local_reads() {
+        let mut logger = fixture_logger();
+        let identity = admitted_fixture_identity().await;
         struct Owned(PathBuf);
         impl Drop for Owned {
             fn drop(&mut self) {
@@ -2089,3 +2245,7 @@ pub use repository::{
 #[path = "module_client.rs"]
 mod module;
 pub use module::{ModuleMutation, ModuleSetting};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "ownership_acceptance.rs"]
+mod ownership_acceptance;

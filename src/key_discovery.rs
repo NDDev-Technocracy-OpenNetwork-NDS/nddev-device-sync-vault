@@ -27,6 +27,12 @@ fn sequences(rows: &[sync3_wire::SyncRow]) -> Result<(Vec<u64>, Option<String>),
     Ok((seqs, hint))
 }
 pub(crate) fn history_hint(body: &[u8], after: u64) -> Result<Option<String>, Error> {
+    history_observation(body, after).map(|(_, hint)| hint)
+}
+pub(crate) fn history_observation(
+    body: &[u8],
+    after: u64,
+) -> Result<(history::HistoryVersion, Option<String>), Error> {
     if !(1..=MAX_PAGE_BYTES).contains(&body.len()) {
         return Err(Error::Invalid);
     }
@@ -34,13 +40,12 @@ pub(crate) fn history_hint(body: &[u8], after: u64) -> Result<Option<String>, Er
     let head = u64::try_from(p.head_seq).map_err(|_| Error::Invalid)?;
     let floor = u64::try_from(p.floor_seq).map_err(|_| Error::Invalid)?;
     let next = u64::try_from(p.next_after_seq).map_err(|_| Error::Invalid)?;
-    history::HistoryVersion {
+    let history = history::HistoryVersion {
         head,
         floor,
         base: floor,
-    }
-    .validate()
-    .map_err(|_| Error::Invalid)?;
+    };
+    history.validate().map_err(|_| Error::Invalid)?;
     if p.schema_version != 3
         || p.entries.len() > 1
         || after < floor
@@ -51,7 +56,7 @@ pub(crate) fn history_hint(body: &[u8], after: u64) -> Result<Option<String>, Er
     }
     let (seqs, hint) = sequences(&p.entries)?;
     history::delta_progress(after, &seqs, next, p.has_more).map_err(|_| Error::Invalid)?;
-    Ok(hint)
+    Ok((history, hint))
 }
 pub(crate) fn base_hint(body: &[u8], expected_base: u64) -> Result<Option<String>, Error> {
     if !(1..=MAX_PAGE_BYTES).contains(&body.len()) {

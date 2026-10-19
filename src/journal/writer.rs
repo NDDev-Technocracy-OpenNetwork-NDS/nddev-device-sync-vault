@@ -76,6 +76,9 @@ pub(super) fn guard_enqueue(
 pub(super) fn read(connection: &Connection) -> Result<WriterSnapshot, Error> {
     connection.query_row("SELECT legacy_v2_context,writer_mode,writer_key_id,confirmed_basis_seq,cursor,known_committed_seq,local_revision FROM v3_meta WHERE singleton=1",[],|r|Ok(WriterSnapshot {facts:WriterFacts {legacy_v2_context:r.get(0)?,mode:r.get(1)?,key_id:r.get(2)?,confirmed_basis_seq:r.get(3)?},cursor:r.get(4)?,known_committed_seq:r.get(5)?,local_revision:r.get(6)?})).map_err(sql_failed)
 }
+pub(super) fn unknown_reason(connection: &Connection) -> Result<Option<String>, Error> {
+    connection.query_row("SELECT terminal_unknown_reason FROM v3_outbox WHERE terminal_unknown_reason IS NOT NULL ORDER BY rowid LIMIT 1", [], |r| r.get(0)).optional().map_err(sql_failed)
+}
 impl Journal {
     pub(crate) fn writer_snapshot(&self) -> Result<WriterSnapshot, Error> {
         self.read(read)
@@ -152,6 +155,6 @@ impl Journal {
         tx.commit().map_err(sql_failed)
     }
     pub(crate) fn unknown_reason(&self) -> Result<Option<String>, Error> {
-        self.read(|c|c.query_row("SELECT terminal_unknown_reason FROM v3_outbox WHERE terminal_unknown_reason IS NOT NULL ORDER BY rowid LIMIT 1",[],|r|r.get(0)).optional().map_err(sql_failed))
+        self.read(unknown_reason)
     }
 }

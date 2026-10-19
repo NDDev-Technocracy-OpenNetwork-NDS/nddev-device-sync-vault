@@ -20,6 +20,15 @@ cancellation. The separate key-provisioning lock remains independent. Admission
 is per batch; retaining a background owner across GUI/CLI attachments is an
 assembly responsibility.
 
+The native `ReplicaTask` retains a separate owner lease between batches. A
+second task follows that owner using one authenticated history observation and
+atomic journal snapshots under its original protected authorization fence. It
+polls local progress while waiting, rather than competing for HTTP admission on
+every poll. The observation expires within Core's batch deadline; it cannot
+renew offline authority or hide pending/Unknown work. After the owner stops,
+an existing follower may acquire ownership through the same OS lock. Actual
+native workers retain both leases until completion.
+
 Persisted writer facts describe the negotiated format, key and observed history;
 they do not grant authorization. Recovery resumes an existing operational stage
 before claiming uploads. A complete snapshot and sufficient contiguous tail may
@@ -90,6 +99,12 @@ Run `just check`. The ignored native acceptance requires an explicitly started i
 isolated native credentials. It checks every replica entry, preserves the exact
 encrypted pending original and local record reads under contention, then
 qualifies real replay after the lease is released.
+
+`just replica-owner-acceptance` uses a separate fresh fixture and isolated native
+credentials. It exercises independent owner/follower clients, actual head and
+pending-state freshness, native secret use and ownership handoff. This qualifies
+the Rust task boundary; GUI attachment retention and CLI assembly require their
+own integration checks.
 
 `just catalog-acceptance` uses a fresh server fixture started with `--fixture-sync3`.
 It sends generated facts for 1024 repositories through real HTTP/PostgreSQL,

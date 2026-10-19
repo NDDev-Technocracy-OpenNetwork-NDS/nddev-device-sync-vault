@@ -24,6 +24,9 @@ fn conflict(connection: &Connection, id: &str) -> Result<Option<Vec<u8>>, Error>
         (SELECT body FROM v3_outbox WHERE kind='vault_record' AND entity_id=?1 AND state='conflict' ORDER BY rowid DESC LIMIT 1),
         (SELECT body FROM v3_conflicts WHERE kind='vault_record' AND entity_id=?1 ORDER BY json_extract(CAST(result AS TEXT),'$.server_seq') DESC LIMIT 1))",[id],|r|r.get(0)).map_err(sql_failed)
 }
+pub(super) fn stats(connection: &Connection) -> Result<(u32, u32, u64, u64, u64), Error> {
+    connection.query_row("SELECT (SELECT count(*) FROM v3_outbox WHERE state='pending'),((SELECT count(*) FROM v3_conflicts)+(SELECT count(*) FROM v3_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM v3_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,last_sync_at,local_revision FROM v3_meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(sql_failed)
+}
 pub(super) fn selected_current(
     connection: &Connection,
     selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
@@ -191,7 +194,7 @@ impl Journal {
         })
     }
     pub fn stats(&self) -> Result<(u32, u32, u64, u64, u64), Error> {
-        self.read(|connection| connection.query_row("SELECT (SELECT count(*) FROM v3_outbox WHERE state='pending'),((SELECT count(*) FROM v3_conflicts)+(SELECT count(*) FROM v3_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM v3_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,last_sync_at,local_revision FROM v3_meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(sql_failed))
+        self.read(stats)
     }
     #[cfg(test)]
     pub fn counts(&self) -> Result<(u32, u32), Error> {
