@@ -13,6 +13,16 @@ native-acceptance:
 replica-admission-acceptance:
     cargo test --locked --features development-http --lib actual_native_replica_admission_preserves_pending_and_local_reads -- --ignored
 
+replica-owner-acceptance:
+    cargo test --locked --features development-http --lib actual_native_owner_has_fresh_followers_and_hands_off -- --ignored
+
+retained-runtime-acceptance:
+    cargo test --locked --features development-http --lib actual_retained_runtime_survives_facade_cancellation_and_reuses_policy -- --ignored
+
+# Fresh owned fixture; actual production capacity and native owner handoff.
+capacity-owner-acceptance:
+    cargo test --locked --features development-http --lib actual_capacity_refusal_survives_owner_handoff_without_original_rewrite -- --ignored
+
 # Fresh owned fixture with the server's encoded-byte page budget.
 large-page-acceptance:
     cargo test --locked --features development-http --lib actual_native_large_page_catchup_preserves_bounds_and_freshness -- --ignored

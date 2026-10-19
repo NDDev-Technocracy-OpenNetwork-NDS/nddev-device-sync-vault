@@ -139,7 +139,7 @@ fn cached_current_handles_reject_future_versions_without_ddl_or_data_mutation() 
     let local = encrypted(&key, "local", "record");
     journal.enqueue(local.clone(), None, 0, None).unwrap();
     let db = Connection::open(owned.0.join("replica.db")).unwrap();
-    db.execute("UPDATE v3_meta SET schema_version=8", [])
+    db.execute("UPDATE v3_meta SET schema_version=?1", [SCHEMA_VERSION + 1])
         .unwrap();
     let layout = names(&db);
     assert!(matches!(

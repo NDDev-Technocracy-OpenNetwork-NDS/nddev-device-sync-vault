@@ -76,7 +76,69 @@ pub(super) fn guard_enqueue(
 pub(super) fn read(connection: &Connection) -> Result<WriterSnapshot, Error> {
     connection.query_row("SELECT legacy_v2_context,writer_mode,writer_key_id,confirmed_basis_seq,cursor,known_committed_seq,local_revision FROM v3_meta WHERE singleton=1",[],|r|Ok(WriterSnapshot {facts:WriterFacts {legacy_v2_context:r.get(0)?,mode:r.get(1)?,key_id:r.get(2)?,confirmed_basis_seq:r.get(3)?},cursor:r.get(4)?,known_committed_seq:r.get(5)?,local_revision:r.get(6)?})).map_err(sql_failed)
 }
+pub(super) fn unknown_reason(connection: &Connection) -> Result<Option<String>, Error> {
+    connection.query_row("SELECT terminal_unknown_reason FROM v3_outbox WHERE terminal_unknown_reason IS NOT NULL ORDER BY rowid LIMIT 1", [], |r| r.get(0)).optional().map_err(sql_failed)
+}
+pub(super) fn capacity_refusal(connection: &Connection) -> Result<Option<(u64, u64)>, Error> {
+    let value: Option<(u64, u64)> = connection.query_row("SELECT capacity_head,capacity_floor FROM v3_outbox WHERE state='pending' AND terminal_unknown_reason IS NULL AND (capacity_head IS NOT NULL OR capacity_floor IS NOT NULL) ORDER BY rowid LIMIT 1", [], |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(sql_failed)?;
+    if let Some((head, floor)) = value {
+        nddev_device_sync_domain::sync::history::HistoryVersion {
+            head,
+            floor,
+            base: floor,
+        }
+        .validate()?;
+    }
+    Ok(value)
+}
 impl Journal {
+    pub(crate) fn capacity_refused(
+        &self,
+        id: &str,
+        request: &[u8],
+        head: u64,
+        floor: u64,
+    ) -> Result<(), Error> {
+        nddev_device_sync_domain::sync::history::HistoryVersion {
+            head,
+            floor,
+            base: floor,
+        }
+        .validate()?;
+        if crate::codec::versioned(request)?.operation.id != id {
+            return Err(Error::Invalid);
+        }
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
+        let stored: Option<(Vec<u8>, Option<u64>, Option<u64>)> = tx.query_row("SELECT body,capacity_head,capacity_floor FROM v3_outbox WHERE id=?1 AND dispatched=1 AND state='pending' AND terminal_unknown_reason IS NULL", [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(sql_failed)?;
+        let Some((body, old_head, old_floor)) = stored else {
+            return Err(Error::Busy);
+        };
+        if body != request {
+            return Err(Error::Invalid);
+        }
+        if (old_head, old_floor) != (Some(head), Some(floor)) {
+            tx.execute(
+                "UPDATE v3_outbox SET capacity_head=?1,capacity_floor=?2 WHERE id=?3",
+                params![head, floor, id],
+            )
+            .map_err(sql_failed)?;
+            tx.execute(
+                "UPDATE v3_meta SET local_revision=local_revision+1 WHERE singleton=1",
+                [],
+            )
+            .map_err(sql_failed)?;
+        }
+        tx.commit().map_err(sql_failed)
+    }
+    pub(crate) fn retry_capacity(&self) -> Result<(), Error> {
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
+        if tx.execute("UPDATE v3_outbox SET capacity_head=NULL,capacity_floor=NULL WHERE state='pending' AND terminal_unknown_reason IS NULL AND (capacity_head IS NOT NULL OR capacity_floor IS NOT NULL)", []).map_err(sql_failed)? > 0 {
+            tx.execute("UPDATE v3_meta SET local_revision=local_revision+1 WHERE singleton=1", []).map_err(sql_failed)?;
+        }
+        tx.commit().map_err(sql_failed)
+    }
     pub(crate) fn writer_snapshot(&self) -> Result<WriterSnapshot, Error> {
         self.read(read)
     }
@@ -152,6 +214,6 @@ impl Journal {
         tx.commit().map_err(sql_failed)
     }
     pub(crate) fn unknown_reason(&self) -> Result<Option<String>, Error> {
-        self.read(|c|c.query_row("SELECT terminal_unknown_reason FROM v3_outbox WHERE terminal_unknown_reason IS NOT NULL ORDER BY rowid LIMIT 1",[],|r|r.get(0)).optional().map_err(sql_failed))
+        self.read(unknown_reason)
     }
 }

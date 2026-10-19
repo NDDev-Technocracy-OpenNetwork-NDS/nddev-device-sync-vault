@@ -19,6 +19,10 @@ use std::{
 };
 use tracing::Instrument;
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[path = "native_replication.rs"]
+pub mod native;
+
 /// Existing session/publication ownership supplied by the assembly. Starting or
 /// replacing a task must hold `publication`; it is not an authorization grant.
 pub struct ReplicaContext {
@@ -41,6 +45,8 @@ pub struct ReplicaTask {
     active: tokio::sync::watch::Sender<Activity>,
     task: Option<runtime::Task>,
     updates: tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    owner: Arc<std::sync::atomic::AtomicBool>,
 }
 impl ReplicaTask {
     pub fn spawn(context: ReplicaContext, initial_delay: Duration, active: bool) -> Self {
@@ -57,10 +63,18 @@ impl ReplicaTask {
             interruption: Arc::new(()),
         });
         let (progress, updates) = tokio::sync::watch::channel(None);
+        #[cfg(not(target_arch = "wasm32"))]
+        let owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(not(target_arch = "wasm32"))]
+        let acquired = owner.clone();
         let task = runtime::spawn(async move {
             let mut schedule = schedule;
             let mut delay = initial_delay;
             let mut published = client_version.is_none();
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut ownership = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut observation: Option<crate::client::ReplicaObservation> = None;
             loop {
                 if !enabled.borrow().active {
                     if enabled.changed().await.is_err() {
@@ -73,11 +87,8 @@ impl ReplicaTask {
                     changed = enabled.changed() => { if changed.is_err() { break; } delay = Duration::ZERO; continue; }
                     _ = runtime::sleep(delay) => {}
                 }
-                let (capacity_check, probe) = {
-                    let policy = schedule.lock().unwrap_or_else(|e| e.into_inner());
-                    (policy.capacity_check(), policy.capacity_probe())
-                };
-                let inbox_only = capacity_check.is_some() && probe.is_none();
+                let mut capacity_check = None;
+                let mut inbox_only = false;
                 let mut inbox_at_head = None;
                 let mut inbox_empty = false;
                 let mut capacity_outcome = None;
@@ -86,7 +97,7 @@ impl ReplicaTask {
                 let Some(vault) = weak.upgrade() else {
                     break;
                 };
-                let Some(result) = run_enabled(
+                let Some(mut result) = run_enabled(
                     &mut enabled,
                     observe("sync.replica.batch", async {
                         // Authority maintenance belongs to this same replica
@@ -95,6 +106,68 @@ impl ReplicaTask {
                             .maintain_authorization()
                             .await
                             .map_err(replica_auth_error)?;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if ownership.is_none() {
+                            match vault.replica_owner().await {
+                                Ok(lease) => {
+                                    // A new elected lifetime restores only actual journal
+                                    // refusal facts. GUI attachment/resume cannot clear them.
+                                    let restored = Arc::new(Mutex::new(
+                                        vault.restored_replica_schedule().await?,
+                                    ));
+                                    let fence = identity
+                                        .local_use_fence_from(&lifetime)
+                                        .await
+                                        .map_err(replica_auth_error)?;
+                                    {
+                                        let _publication = publication
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner());
+                                        identity
+                                            .check_local_use_lifetime(&fence)
+                                            .map_err(replica_auth_error)?;
+                                        let mut current = policy_slot
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner());
+                                        if !Arc::ptr_eq(&current, &schedule) {
+                                            return Err(VaultError::Cancelled);
+                                        }
+                                        *current = restored.clone();
+                                        schedule = restored;
+                                    }
+                                    ownership = Some(lease);
+                                    acquired.store(true, std::sync::atomic::Ordering::Release);
+                                    tracing::info!(
+                                        event.name = "sync.replica.owner",
+                                        module = "vault",
+                                        outcome = "ok"
+                                    );
+                                }
+                                Err(VaultError::Busy) => {
+                                    if observation.as_ref().is_none_or(|value| value.expired()) {
+                                        observation =
+                                            Some(vault.begin_replica_observation().await?);
+                                    }
+                                    let observed = vault
+                                        .observe_replica(
+                                            observation.as_ref().ok_or(VaultError::Invalid)?,
+                                        )
+                                        .await?;
+                                    if observed.caught_up {
+                                        observation = None;
+                                    }
+                                    inbox_at_head = Some(observed.inbox_at_head);
+                                    return Ok(observed.view);
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        let probe = {
+                            let policy = schedule.lock().unwrap_or_else(|error| error.into_inner());
+                            capacity_check = policy.capacity_check();
+                            policy.capacity_probe()
+                        };
+                        inbox_only = capacity_check.is_some() && probe.is_none();
                         if probe.is_some() {
                             let attempt = vault.probe_capacity_attempt().await?;
                             attempt_history = attempt.history;
@@ -195,6 +268,12 @@ impl ReplicaTask {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .after_with_sample(outcome, sample);
+                if let Ok(view) = &mut result {
+                    project_policy(
+                        view,
+                        &schedule.lock().unwrap_or_else(|error| error.into_inner()),
+                    );
+                }
                 progress.send_replace(Some(result));
                 let Some(next) = next else {
                     break;
@@ -206,6 +285,8 @@ impl ReplicaTask {
             active,
             task: Some(task),
             updates,
+            #[cfg(not(target_arch = "wasm32"))]
+            owner,
         }
     }
     pub fn set_active(&self, active: bool) {
@@ -216,6 +297,12 @@ impl ReplicaTask {
     }
     pub fn is_running(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+    /// This running task acquired native ownership. False after cancellation
+    /// does not assert that an outstanding native worker has finished draining.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn is_owner(&self) -> bool {
+        self.is_running() && self.owner.load(std::sync::atomic::Ordering::Acquire)
     }
     /// Latest actual completed batch; there is no unbounded notification queue.
     pub fn updates(&self) -> tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>> {
@@ -228,6 +315,17 @@ impl ReplicaTask {
             task.abort();
         }
         task
+    }
+}
+
+/// Preserve the canonical upload refusal alongside a successful inbox read.
+/// A read cannot clear upload policy or disguise a terminal/current read error.
+pub fn project_policy(view: &mut VaultView, schedule: &ReplicaSchedule) {
+    if schedule.is_capacity_blocked() {
+        if view.sync_error.is_empty() {
+            view.sync_error = VaultError::CapacityExhausted.code();
+        }
+        view.catching_up = true;
     }
 }
 impl Drop for ReplicaTask {

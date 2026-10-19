@@ -68,6 +68,21 @@ pub struct SyncAttempt<T> {
     pub result: Result<T, Error>,
     pub history: Option<nddev_device_sync_domain::sync::history::HistoryVersion>,
 }
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ReplicaObservation {
+    scope: Scope,
+    fence: nddev_device_sync_accounts::LocalUseFence,
+    before: crate::journal::WriterSnapshot,
+    history: nddev_device_sync_domain::sync::history::HistoryVersion,
+    hint: Option<String>,
+    started: nddev_device_sync_accounts::runtime::Instant,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl ReplicaObservation {
+    pub(crate) fn expired(&self) -> bool {
+        self.started.elapsed() >= replica::BATCH_DEADLINE
+    }
+}
 pub struct VaultClient {
     identity: Arc<IdentityClient>,
     scope: Scope,
@@ -223,6 +238,12 @@ impl VaultClient {
         view.last_sync_at = last_sync_at;
         Ok(view.clone())
     }
+    pub(crate) fn begin_reconciliation(&self) {
+        self.view
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .catching_up = true;
+    }
     pub async fn refresh(&self) -> Result<VaultView, Error> {
         self.synchronize().await
     }
@@ -231,6 +252,171 @@ impl VaultClient {
     pub async fn refresh_local(&self) -> Result<VaultView, Error> {
         let _permit = self.admitted()?;
         self.update_view().await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn replica_owner(&self) -> Result<Arc<std::fs::File>, Error> {
+        self.authorized()?;
+        self.journal.owner_lock().await
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pub(crate) async fn drain_replica(&self) -> Result<(), Error> {
+        self.journal.drain().await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn replica_snapshot(&self) -> Result<crate::journal::ReplicaSnapshot, Error> {
+        match self
+            .journal
+            .call(crate::storage::Command::ReplicaSnapshot)
+            .await?
+        {
+            crate::storage::Reply::ReplicaSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(Error::Invalid),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn restored_replica_schedule(
+        &self,
+    ) -> Result<nddev_device_sync_application::lifecycle::ReplicaSchedule, Error> {
+        let fence = self
+            .identity
+            .local_use_fence()
+            .await
+            .map_err(identity_failure)?;
+        let snapshot = self.replica_snapshot().await?;
+        let mut policy = nddev_device_sync_application::lifecycle::ReplicaSchedule::default();
+        if let Some((head, floor)) = snapshot.capacity {
+            let history = nddev_device_sync_domain::sync::history::HistoryVersion {
+                head,
+                floor,
+                base: floor,
+            };
+            history.validate()?;
+            policy.observe_history(history);
+            policy.after(nddev_device_sync_application::lifecycle::BatchOutcome::CapacityExhausted);
+        }
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        Ok(policy)
+    }
+    /// Freeze one authenticated observation for this bounded follower wait.
+    /// Subsequent local polling cannot compete with the owner's HTTP admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn begin_replica_observation(&self) -> Result<ReplicaObservation, Error> {
+        use nddev_device_sync_domain::sync::history::HistoryVersion;
+        self.authorized()?;
+        let started = nddev_device_sync_accounts::runtime::Instant::now();
+        let fence = self
+            .identity
+            .local_use_fence()
+            .await
+            .map_err(identity_failure)?;
+        let before = self.replica_snapshot().await?;
+        let reply = self
+            .identity
+            .sync_request(SyncRequest::HistoryV3 {
+                after: before.writer.cursor,
+                limit: 1,
+            })
+            .await
+            .map_err(identity_failure)?;
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        let (history, hint) = match reply.expiry().map_err(identity_failure)? {
+            Some(nddev_device_sync_accounts::SyncExpiry::V3(expired)) => {
+                let floor = expired.floor_seq.try_into().map_err(|_| Error::Invalid)?;
+                (
+                    HistoryVersion {
+                        head: expired.head_seq.try_into().map_err(|_| Error::Invalid)?,
+                        floor,
+                        base: floor,
+                    },
+                    None,
+                )
+            }
+            None if reply.status == 200 => {
+                crate::key_discovery::history_observation(&reply.body, before.writer.cursor)?
+            }
+            _ => return Err(Error::Unavailable),
+        };
+        history.validate()?;
+        Ok(ReplicaObservation {
+            scope: self.scope.clone(),
+            fence,
+            before: before.writer,
+            history,
+            hint,
+            started,
+        })
+    }
+    /// Local progress under that exact protected observation. No claim, upload,
+    /// key provisioning, durable freshness write or authorization renewal.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn observe_replica(
+        &self,
+        observation: &ReplicaObservation,
+    ) -> Result<InboxProgress, Error> {
+        use nddev_device_sync_domain::sync::history::InstallVersion;
+        if observation.scope != self.scope {
+            return Err(Error::Locked);
+        }
+        if observation.expired() {
+            return Err(Error::Busy);
+        }
+        self.identity
+            .validate_local_use(&observation.fence)
+            .await
+            .map_err(identity_failure)?;
+        let version = |snapshot: &crate::journal::WriterSnapshot| InstallVersion {
+            cursor: snapshot.cursor,
+            known_committed_seq: snapshot.known_committed_seq,
+            local_revision: snapshot.local_revision,
+        };
+        let key = self.key().await?.ok_or(Error::Busy)?;
+        if observation
+            .hint
+            .as_ref()
+            .is_some_and(|hint| hint != &key.id())
+        {
+            return Err(Error::Authentication);
+        }
+        let current = self.replica_snapshot().await?;
+        let caught_up = replica::follower_caught_up(
+            version(&observation.before),
+            version(&current.writer),
+            observation.history,
+            current.pending,
+            current.unknown_reason.is_some(),
+        )?;
+        let view = VaultView {
+            unlocked: true,
+            key_id: key.id(),
+            pending: current.pending,
+            conflicts: current.conflicts,
+            cursor: current.writer.cursor,
+            local_revision: current.writer.local_revision,
+            last_sync_at: current.last_sync_at,
+            catching_up: !caught_up,
+            sync_error: if current.unknown_reason.is_none() && current.capacity.is_some() {
+                Error::CapacityExhausted.code()
+            } else {
+                unknown_reason_code(current.unknown_reason.as_deref())?.into()
+            },
+            browser_persistent: None,
+        };
+        self.identity
+            .validate_local_use(&observation.fence)
+            .await
+            .map_err(identity_failure)?;
+        *self.view.lock().unwrap_or_else(|error| error.into_inner()) = view.clone();
+        Ok(InboxProgress {
+            inbox_at_head: view.cursor >= observation.history.head,
+            caught_up,
+            view,
+        })
     }
     async fn prepare_identity(&self) -> Result<(), Error> {
         if !self.identity.view().session_verified {
@@ -1034,6 +1220,18 @@ impl VaultClient {
         &self,
         inbox_only: bool,
     ) -> Result<SyncAttempt<InboxProgress>, Error> {
+        self.synchronize_attempt_inner(inbox_only, false).await
+    }
+    /// Explicit user retry may clear only the retained refusal metadata. Exact
+    /// dispatched request bytes and terminal Unknown reasons remain unchanged.
+    pub async fn retry_synchronize_attempt(&self) -> Result<SyncAttempt<InboxProgress>, Error> {
+        self.synchronize_attempt_inner(false, true).await
+    }
+    async fn synchronize_attempt_inner(
+        &self,
+        inbox_only: bool,
+        retry: bool,
+    ) -> Result<SyncAttempt<InboxProgress>, Error> {
         self.authorized()?;
         let _permit = self
             .sync_gate
@@ -1042,12 +1240,23 @@ impl VaultClient {
             .map_err(|_| Error::Busy)?;
         #[cfg(not(target_arch = "wasm32"))]
         let _replica = self.journal.replica_lock().await?;
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .catching_up = true;
+        self.begin_reconciliation();
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             self.prepare_identity().await?;
+            if retry {
+                let fence = self
+                    .identity
+                    .local_use_fence()
+                    .await
+                    .map_err(identity_failure)?;
+                self.journal
+                    .call_guarded(crate::storage::Command::RetryCapacity, || {
+                        self.identity
+                            .check_local_use_lifetime(&fence)
+                            .map_err(identity_failure)
+                    })
+                    .await?;
+            }
             self.reconcile_inner(inbox_only).await
         })
         .await
@@ -1108,51 +1317,7 @@ impl VaultClient {
             }
             self.prepare_identity().await?;
             self.synchronize_inner().await?;
-            let key = self.key().await?.ok_or(Error::Locked)?;
-            let writer = DeviceId::new(self.scope.device.clone()).map_err(dependency)?;
-            let mut targets = std::collections::BTreeSet::new();
-            let mut prepared = Vec::new();
-            for snapshot in snapshots {
-                let (kind, id) = match &snapshot.data {
-                    State::Repository { .. } => return Err(Error::Invalid),
-                    State::Device { .. } => (EntityKind::DeviceState, self.scope.device.clone()),
-                    State::Module { module_id, .. } => (
-                        EntityKind::ModuleState,
-                        format!("{}:{module_id}", self.scope.device),
-                    ),
-                    // Only the explicit CAS command may change desired state.
-                    State::ModuleConfiguration { .. } => return Err(Error::Invalid),
-                    State::Account { .. } => (
-                        EntityKind::AccountState,
-                        format!("{}:nds", self.scope.device),
-                    ),
-                };
-                snapshot
-                    .validate(&writer, kind, &id)
-                    .map_err(|_| Error::Invalid)?;
-                if !targets.insert((kind.as_str(), id.clone())) {
-                    return Err(Error::Invalid);
-                }
-                let lookup_id = id.clone();
-                let previous = self.journal.entity(kind.as_str(), &lookup_id).await?;
-                if let Some(previous) = previous {
-                    let envelope = codec::versioned(&previous.body)?;
-                    let bytes = key.decrypt_versioned(&self.scope, &envelope)?;
-                    if let Ok(previous) = serde_json::from_slice::<Snapshot>(&bytes)
-                        && previous.data == snapshot.data
-                    {
-                        continue;
-                    }
-                }
-                let bytes = Zeroizing::new(serde_json::to_vec(&snapshot).map_err(dependency)?);
-                if bytes.len() > MAX_PLAIN_BYTES {
-                    return Err(Error::Invalid);
-                }
-                prepared.push((kind, id, bytes));
-            }
-            for (kind, id, bytes) in prepared {
-                self.put_inner(kind, id, bytes.as_slice(), None).await?;
-            }
+            self.stage_states_inner(snapshots).await?;
             self.synchronize_inner().await
         })
         .await
@@ -1162,6 +1327,64 @@ impl VaultClient {
             result: self.finish_sync(result),
             history: self.observed_history(),
         })
+    }
+    /// Stage native observations under the caller's local authorization and
+    /// cancellation fence. The retained owner handles network reconciliation.
+    pub async fn stage_states(&self, snapshots: Vec<Snapshot>) -> Result<VaultView, Error> {
+        let _permit = self.admitted()?;
+        self.stage_states_inner(snapshots).await?;
+        self.update_view().await
+    }
+    async fn stage_states_inner(&self, snapshots: Vec<Snapshot>) -> Result<(), Error> {
+        if snapshots.is_empty() || snapshots.len() > 32 {
+            return Err(Error::Invalid);
+        }
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let writer = DeviceId::new(self.scope.device.clone()).map_err(dependency)?;
+        let mut targets = std::collections::BTreeSet::new();
+        let mut prepared = Vec::new();
+        for snapshot in snapshots {
+            let (kind, id) = match &snapshot.data {
+                State::Repository { .. } => return Err(Error::Invalid),
+                State::Device { .. } => (EntityKind::DeviceState, self.scope.device.clone()),
+                State::Module { module_id, .. } => (
+                    EntityKind::ModuleState,
+                    format!("{}:{module_id}", self.scope.device),
+                ),
+                // Only the explicit CAS command may change desired state.
+                State::ModuleConfiguration { .. } => return Err(Error::Invalid),
+                State::Account { .. } => (
+                    EntityKind::AccountState,
+                    format!("{}:nds", self.scope.device),
+                ),
+            };
+            snapshot
+                .validate(&writer, kind, &id)
+                .map_err(|_| Error::Invalid)?;
+            if !targets.insert((kind.as_str(), id.clone())) {
+                return Err(Error::Invalid);
+            }
+            let lookup_id = id.clone();
+            let previous = self.journal.entity(kind.as_str(), &lookup_id).await?;
+            if let Some(previous) = previous {
+                let envelope = codec::versioned(&previous.body)?;
+                let bytes = key.decrypt_versioned(&self.scope, &envelope)?;
+                if let Ok(previous) = serde_json::from_slice::<Snapshot>(&bytes)
+                    && previous.data == snapshot.data
+                {
+                    continue;
+                }
+            }
+            let bytes = Zeroizing::new(serde_json::to_vec(&snapshot).map_err(dependency)?);
+            if bytes.len() > MAX_PLAIN_BYTES {
+                return Err(Error::Invalid);
+            }
+            prepared.push((kind, id, bytes));
+        }
+        for (kind, id, bytes) in prepared {
+            self.put_inner(kind, id, bytes.as_slice(), None).await?;
+        }
+        Ok(())
     }
     pub async fn states(&self, after: String) -> Result<StatePage, Error> {
         let _permit = self.admitted()?;
@@ -1312,10 +1535,7 @@ impl VaultClient {
             .map(|progress| progress.view)
     }
     async fn reconcile_inner(&self, inbox_only: bool) -> Result<InboxProgress, Error> {
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .catching_up = true;
+        self.begin_reconciliation();
         let port = history_replica::Replica::new(self).await?;
         let progress = if inbox_only {
             replica::reconcile_inbox(&port).await?
@@ -1336,18 +1556,21 @@ impl VaultClient {
             _ => return Err(Error::Invalid),
         };
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-        view.sync_error = match reason.as_deref() {
-            Some("basis_expired") => "sync_basis_expired",
-            Some("legacy_missing") => "sync_legacy_outcome_unknown",
-            None => "",
-            _ => return Err(Error::Invalid),
-        }
-        .into();
+        view.sync_error = unknown_reason_code(reason.as_deref())?.into();
         Ok(InboxProgress {
             view: view.clone(),
             inbox_at_head: progress.inbox_at_head,
             caught_up: progress.caught_up,
         })
+    }
+}
+
+fn unknown_reason_code(reason: Option<&str>) -> Result<&'static str, Error> {
+    match reason {
+        Some("basis_expired") => Ok("sync_basis_expired"),
+        Some("legacy_missing") => Ok("sync_legacy_outcome_unknown"),
+        None => Ok(""),
+        _ => Err(Error::Invalid),
     }
 }
 
@@ -1396,7 +1619,7 @@ fn key_registry(secret: &[u8]) -> Result<Vec<VaultKey>, Error> {
     Ok(keys)
 }
 
-fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
+pub(crate) fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
     let view = identity.view();
     if !view.authenticated || view.credential_revalidation_required {
         return Err(Error::Locked);
@@ -1605,24 +1828,23 @@ mod tests {
         (receipt, identity)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and isolated native credentials"]
-    async fn actual_native_replica_admission_preserves_pending_and_local_reads() {
-        let mut logger =
-            nddev_device_sync_telemetry::install(nddev_device_sync_telemetry::Config {
-                service: "nds-vault-acceptance".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault".into(),
-                commit: "unknown".into(),
-                channel: "alpha".into(),
-                standards: "unreleased".into(),
-                environment: "development".into(),
-                target_prefixes: vec!["nds_accounts".into(), "nddev_device_sync_vault".into()],
-                default_module: "vault".into(),
-                debug: None,
-            })
-            .unwrap();
+    pub(super) fn fixture_logger() -> nddev_device_sync_telemetry::Logger {
+        nddev_device_sync_telemetry::install(nddev_device_sync_telemetry::Config {
+            service: "nds-vault-acceptance".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault".into(),
+            commit: "unknown".into(),
+            channel: "alpha".into(),
+            standards: "unreleased".into(),
+            environment: "development".into(),
+            target_prefixes: vec!["nds_accounts".into(), "nddev_device_sync_vault".into()],
+            default_module: "vault".into(),
+            debug: None,
+        })
+        .unwrap()
+    }
+
+    pub(super) async fn admitted_fixture_identity() -> Arc<IdentityClient> {
         let (_receipt, identity) = fixture_identity().await;
         // Seed only the empty fixture counter, then wait for its explicit
         // operator admission. Never race a live writer-mode transition.
@@ -1644,6 +1866,15 @@ mod tests {
         })
         .await
         .unwrap();
+        identity
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and isolated native credentials"]
+    async fn actual_native_replica_admission_preserves_pending_and_local_reads() {
+        let mut logger = fixture_logger();
+        let identity = admitted_fixture_identity().await;
         struct Owned(PathBuf);
         impl Drop for Owned {
             fn drop(&mut self) {
@@ -2089,3 +2320,7 @@ pub use repository::{
 #[path = "module_client.rs"]
 mod module;
 pub use module::{ModuleMutation, ModuleSetting};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "ownership_acceptance.rs"]
+mod ownership_acceptance;

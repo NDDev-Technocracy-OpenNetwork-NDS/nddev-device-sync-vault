@@ -325,7 +325,7 @@ fn checkpoint_schema_six_migration_preserves_exact_rows_and_cached_old_statement
         c.query_row("SELECT schema_version FROM replica_meta", [], |r| r
             .get::<_, u32>(0))
             .unwrap(),
-        7
+        SCHEMA_VERSION
     );
     assert_eq!(stored_outbox(&reopened), before);
 }
@@ -649,7 +649,7 @@ fn supported_unknown_sequence_original_receipt_hydration(version: u32, normalize
         c.query_row("SELECT schema_version FROM v3_meta", [], |r| r
             .get::<_, u32>(0))
             .unwrap(),
-        7
+        SCHEMA_VERSION
     );
     assert!(
         c.query_row(
