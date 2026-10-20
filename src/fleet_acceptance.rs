@@ -275,7 +275,7 @@ async fn native_fleet_member() -> Result<()> {
             && origin.port().is_some()
     );
     let config = nddev_device_sync_telemetry::Config {
-        service: "nds-fleet-acceptance".into(),
+        service: "nddev-device-sync-client".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault".into(),
         commit: std::env::var("NDS_FLEET_SOURCE")?,

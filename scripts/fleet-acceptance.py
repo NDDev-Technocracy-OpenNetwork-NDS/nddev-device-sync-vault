@@ -236,7 +236,7 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
                     if len(line)>65536:raise RuntimeError('Log record exceeded its bound')
                     try:value=json.loads(line)
                     except json.JSONDecodeError:continue
-                    if not isinstance(value,dict) or value.get('service.name')!='nds-fleet-acceptance':continue
+                    if not isinstance(value,dict) or value.get('service.name')!='nddev-device-sync-client':continue
                     assert value['producer.sequence']==sequence+1
                     sequence=value['producer.sequence'];events+=1
                     instance=instance or value['producer.instance_id'];assert instance==value['producer.instance_id']
