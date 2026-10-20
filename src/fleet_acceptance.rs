@@ -94,6 +94,27 @@ fn changed(id: u64, offline: bool) -> ObservationData {
     data
 }
 
+fn expected_values(count: usize, updated: bool, offline: bool, round: u64) -> Vec<ObservationData> {
+    let mut values = generated_values();
+    for data in &mut values {
+        if let ObservationData::Repository { repository } = data {
+            let id = repository.id.value();
+            if updated && id == 1 {
+                repository.archived = true;
+            }
+            if offline && (33..33 + count as u64).contains(&id) {
+                repository.archived = true;
+                repository.default_branch = Some("fleet-offline".into());
+            }
+            if round > 0 && (65..65 + count as u64).contains(&id) {
+                repository.archived = true;
+                repository.default_branch = Some(format!("fleet-round-{round}"));
+            }
+        }
+    }
+    values
+}
+
 async fn queue(vault: &VaultClient, data: ObservationData) -> Result<()> {
     let context = context();
     let fence = Arc::new(vault.identity.local_use_fence().await?);
@@ -195,23 +216,16 @@ async fn resolve(vault: &VaultClient) -> Result<()> {
     Ok(())
 }
 
-async fn inspect(vault: &VaultClient, count: usize, updated: bool, offline: bool) -> Result<Value> {
+async fn inspect(
+    vault: &VaultClient,
+    count: usize,
+    updated: bool,
+    offline: bool,
+    round: u64,
+) -> Result<Value> {
     let view = settle(vault).await?;
     let saved = catalog(vault).await?;
-    let mut expected = generated_values();
-    if updated {
-        for data in &mut expected {
-            if let ObservationData::Repository { repository } = data {
-                if repository.id.value() == 1 {
-                    repository.archived = true;
-                }
-                if offline && (33..33 + count as u64).contains(&repository.id.value()) {
-                    repository.archived = true;
-                    repository.default_branch = Some("fleet-offline".into());
-                }
-            }
-        }
-    }
+    let expected = expected_values(count, updated, offline, round);
     for data in expected {
         let observation = RepositoryObservation {
             source: ObservationSource {
@@ -260,7 +274,7 @@ async fn native_fleet_member() -> Result<()> {
             && origin.host_str() == Some("127.0.0.1")
             && origin.port().is_some()
     );
-    let mut logger = nddev_device_sync_telemetry::install(nddev_device_sync_telemetry::Config {
+    let config = nddev_device_sync_telemetry::Config {
         service: "nds-fleet-acceptance".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault".into(),
@@ -271,7 +285,21 @@ async fn native_fleet_member() -> Result<()> {
         target_prefixes: vec!["nds_accounts".into(), "nddev_device_sync_vault".into()],
         default_module: "vault".into(),
         debug: None,
-    })?;
+    };
+    // The restarted epoch qualifies online delivery after the existing offline
+    // restore. Native queues are bounded RAM; the first epoch's local capture
+    // does not claim durable cross-process telemetry delivery.
+    let traces = (epoch == 1 && std::env::var("NDS_FLEET_EXPORT").as_deref() == Ok("1"))
+        .then(|| nddev_device_sync_telemetry::client_traces::ClientTraces::new(&config))
+        .transpose()?;
+    let mut logger = match &traces {
+        Some(traces) => nddev_device_sync_telemetry::install_client_with_tracer_to(
+            config,
+            traces.tracer(),
+            nddev_device_sync_telemetry::LocalOutput::Stderr,
+        )?,
+        None => nddev_device_sync_telemetry::install(config)?,
+    };
     let protected = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         protected(panic);
@@ -331,6 +359,19 @@ async fn native_fleet_member() -> Result<()> {
     } else {
         vault.refresh_local().await?
     };
+    let delivery = traces
+        .as_ref()
+        .map(|traces| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                nddev_device_sync_accounts::telemetry::Delivery::start(
+                    identity.clone(),
+                    logger.control.subscribe()?,
+                    traces.subscribe()?,
+                    true,
+                ),
+            )
+        })
+        .transpose()?;
     if epoch == 1 {
         assert_eq!(view.pending, 1);
         let expected: BTreeMap<String, String> =
@@ -411,7 +452,7 @@ async fn native_fleet_member() -> Result<()> {
                             publish(&vault, &context(), &generated_values()).await?,
                             1056
                         );
-                        inspect(&vault, count, false, false).await
+                        inspect(&vault, count, false, false, 0).await
                     }
                     "inspect" => {
                         inspect(
@@ -419,18 +460,37 @@ async fn native_fleet_member() -> Result<()> {
                             count,
                             command["updated"] == true,
                             command["offline"] == true,
+                            command["round"].as_u64().unwrap_or(0),
                         )
                         .await
                     }
                     "unchanged" => {
                         let cursor = settle(&vault).await?.cursor;
-                        assert_eq!(publish(&vault, &context(), &generated_values()).await?, 0);
+                        let expected = expected_values(
+                            count,
+                            command["updated"] == true,
+                            command["offline"] == true,
+                            command["round"].as_u64().unwrap_or(0),
+                        );
+                        assert_eq!(publish(&vault, &context(), &expected).await?, 0);
                         assert_eq!(settle(&vault).await?.cursor, cursor);
                         Ok(json!({"unchanged":true,"cursor":cursor}))
                     }
                     "race" => {
                         queue(&vault, changed(1, false)).await?;
                         Ok(json!({"queued":true}))
+                    }
+                    "sustain" => {
+                        let round = command["round"].as_u64().ok_or("missing fleet round")?;
+                        assert!((1..=32).contains(&round));
+                        let data = expected_values(count, true, true, round)
+                            .into_iter()
+                            .find(|data| matches!(data, ObservationData::Repository { repository }
+                                if repository.id.value() == 65 + index as u64))
+                            .ok_or("missing generated repository")?;
+                        queue(&vault, data).await?;
+                        let view = drain(&vault).await?;
+                        Ok(json!({"cursor":view.cursor,"pending":view.pending,"round":round}))
                     }
                     "drain" => {
                         let v = drain(&vault).await?;
@@ -467,9 +527,22 @@ async fn native_fleet_member() -> Result<()> {
                                     .count(),
                                 count
                             );
-                            identity.logout().await?;
                         }
-                        Ok(json!({"finished":true}))
+                        let telemetry = if let Some(delivery) = &delivery {
+                            let state = delivery.flush().await;
+                            Some(json!({
+                                "enabled":matches!(state.policy, nddev_device_sync_accounts::telemetry::ExportPolicy::Enabled),
+                                "events":state.delivered,"spans":state.spans_delivered,
+                                "pending":state.pending+state.spans_pending,
+                                "dropped":state.dropped+state.spans_dropped,
+                                "failures":state.failures+state.spans_failures,
+                            }))
+                        } else {
+                            None
+                        };
+                        // All credentials belong to disposable per-client
+                        // keyrings and are removed by the owned supervisor.
+                        Ok(json!({"finished":true,"telemetry":telemetry}))
                     }
                     _ => Err("unknown fleet action".into()),
                 }
@@ -487,6 +560,10 @@ async fn native_fleet_member() -> Result<()> {
     }
     drop(vault);
     drop(identity);
+    drop(delivery);
+    if let Some(traces) = traces {
+        traces.shutdown();
+    }
     logger.shutdown();
     let output = logger.control.output_health();
     assert_eq!(

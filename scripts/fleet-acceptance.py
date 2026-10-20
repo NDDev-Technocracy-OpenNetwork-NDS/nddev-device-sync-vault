@@ -58,6 +58,8 @@ parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--fixture',type=Path,required=True)
 parser.add_argument('--output',type=Path,required=True)
 parser.add_argument('--clients',type=int,choices=range(2,33),default=32)
+parser.add_argument('--rounds',type=int,choices=range(0,33),default=8)
+parser.add_argument('--telemetry',action='store_true',help='Qualify signed log/trace delivery in the restarted online epoch against the owned collector')
 args=parser.parse_args()
 assert sys.platform=='linux' and args.fixture.is_absolute() and args.output.is_absolute()
 assert not args.output.resolve().is_relative_to(ROOT) and not args.output.exists()
@@ -158,7 +160,7 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
             for name in ['data/keyrings','state','config','cache','runtime','control']:(root/name).mkdir(parents=True,mode=0o700)
             env={k:v for k,v in os.environ.items() if k in ['PATH','HOME','LANG','LC_ALL','LD_LIBRARY_PATH']}
             env.update({k:str(root/v) for k,v in [('XDG_DATA_HOME','data'),('XDG_STATE_HOME','state'),('XDG_CONFIG_HOME','config'),('XDG_CACHE_HOME','cache'),('XDG_RUNTIME_DIR','runtime')]})
-            env.update({'NDS_FLEET_ROOT':str(root),'NDS_FLEET_INDEX':str(index),'NDS_FLEET_COUNT':str(args.clients),'NDS_FLEET_SOCKET':str(base/'control.sock'),'NDS_FLEET_TOKEN_SOCKET':str(base/'session.sock'),'NDS_FIXTURE_RECEIPT':str(args.fixture),'NDS_FLEET_SOURCE':'unknown' if dirty else source})
+            env.update({'NDS_FLEET_ROOT':str(root),'NDS_FLEET_INDEX':str(index),'NDS_FLEET_COUNT':str(args.clients),'NDS_FLEET_SOCKET':str(base/'control.sock'),'NDS_FLEET_TOKEN_SOCKET':str(base/'session.sock'),'NDS_FIXTURE_RECEIPT':str(args.fixture),'NDS_FLEET_SOURCE':'unknown' if dirty else source,'NDS_FLEET_EXPORT':'1' if args.telemetry else '0'})
             log=(args.output/f'supervisor-{index}.log').open('wb')
             try:processes.append(subprocess.Popen(['dbus-run-session','--',sys.executable,__file__,'--worker',str(root),executable,str(index),str(args.clients),str(args.output)],env=env,stdout=log,stderr=log,start_new_session=True))
             finally:log.close()
@@ -207,9 +209,25 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
             assert value==ready[index];restored[index]=value
         event('cold_offline_restored',clients=args.clients)
         mode('online');all_clients('drain');final=all_clients('inspect',updated=True,offline=True);uniform(final)
-        for index in range(1,args.clients):send(index,'finish');assert read(index)['finished']
+        for round in range(1,args.rounds+1):
+            started=time.monotonic()
+            all_clients('sustain',round=round)
+            final=all_clients('inspect',updated=True,offline=True,round=round);uniform(final)
+            cursor=final[0]['cursor']
+            unchanged=all_clients('unchanged',updated=True,offline=True,round=round)
+            assert all(value['unchanged'] and value['cursor']==cursor for value in unchanged)
+            event('sustained_round',round=round,seconds=float(f'{time.monotonic()-started:.3f}'),cursor=cursor)
+        deliveries=[]
+        def finish(index):
+            send(index,'finish');value=read(index);assert value['finished']
+            if args.telemetry:
+                observed=value['telemetry']
+                assert observed['enabled'] and observed['events']>0 and observed['spans']>0
+                assert observed['pending']==observed['dropped']==0,observed
+                deliveries.append({'index':index,**observed})
+        for index in range(1,args.clients):finish(index)
         for index in range(1,args.clients):assert processes[index].wait(timeout=10)==0
-        send(0,'finish');assert read(0)['finished'];assert processes[0].wait(timeout=10)==0
+        finish(0);assert processes[0].wait(timeout=10)==0
         captured=[]
         for path in sorted(args.output.glob('client-*.log.gz')):
             sequence=0;events=0;instance=None
@@ -226,7 +244,7 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
                     assert value['event.name'] not in ['logging.event.rejected','logging.fields.rejected']
             assert events>0
             captured.append({'file':path.name,'events':events,**json.loads(path.with_name(path.name.replace('.log.gz','-capture.json')).read_text())})
-        proof={'captured':captured,'source':source,'dirty_source':dirty,'clients':args.clients,'repositories':1024,'owners':32,'native_processes':args.clients*2,'final':final[0],'phases':history,'scope':'Real Rust clients, separate Secret Service/SQLite, genuine restored fixture session, real HTTP/PostgreSQL; generated catalog inputs, not GitHub-provider acceptance.'}
+        proof={'captured':captured,'source':source,'dirty_source':dirty,'clients':args.clients,'repositories':1024,'owners':32,'native_processes':args.clients*2,'rounds':args.rounds,'telemetry':deliveries,'final':final[0],'phases':history,'scope':'One generated NDS account,32 GitHub catalog owners; real Rust clients, separate Secret Service/SQLite, genuine restored fixture session, real HTTP/PostgreSQL. Optional signed telemetry covers the restarted online epoch, not native cross-process offline log retention. Generated catalog inputs are not GitHub-provider acceptance.'}
         (args.output/'receipt.json').write_text(json.dumps(proof,indent=2)+'\n');event('complete',clients=args.clients)
     finally:
         for connection in sockets.values():connection.close()
