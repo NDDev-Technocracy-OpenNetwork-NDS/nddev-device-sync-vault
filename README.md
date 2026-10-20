@@ -34,6 +34,9 @@ Rust identity, Vault, task, scheduling policy and telemetry delivery across
 presentation attachments. Its identity has an independent cancellation lifetime;
 reopening attaches without replacing policy. Explicit retry, logout/account
 replacement and process shutdown have separate bounded stop/drain paths.
+Graceful CLI completion drains replication before flushing the same retained
+sender; its identity stays valid until full shutdown. Sharing a sender handle
+does not create another exporter or extend authority after cancellation.
 `stage_states` reuses observation validation and encryption under the calling
 facade's own authorization fence; the retained owner performs reconciliation.
 
