@@ -24,7 +24,7 @@ nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-Open
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
 nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "f628a85bee38b837351e8621f5711d4b2958934c" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "4adcc8bde6cd4e527b3543bd349d8855896ce844" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "99e4bcf48ec34ff8233bfb1e0f1ed689d935e2a7" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
