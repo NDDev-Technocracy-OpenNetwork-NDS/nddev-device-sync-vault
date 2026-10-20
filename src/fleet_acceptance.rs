@@ -286,20 +286,7 @@ async fn native_fleet_member() -> Result<()> {
         default_module: "vault".into(),
         debug: None,
     };
-    // The restarted epoch qualifies online delivery after the existing offline
-    // restore. Native queues are bounded RAM; the first epoch's local capture
-    // does not claim durable cross-process telemetry delivery.
-    let traces = (epoch == 1 && std::env::var("NDS_FLEET_EXPORT").as_deref() == Ok("1"))
-        .then(|| nddev_device_sync_telemetry::client_traces::ClientTraces::new(&config))
-        .transpose()?;
-    let mut logger = match &traces {
-        Some(traces) => nddev_device_sync_telemetry::install_client_with_tracer_to(
-            config,
-            traces.tracer(),
-            nddev_device_sync_telemetry::LocalOutput::Stderr,
-        )?,
-        None => nddev_device_sync_telemetry::install(config)?,
-    };
+    let mut logger = nddev_device_sync_telemetry::install(config)?;
     let protected = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         protected(panic);
@@ -359,19 +346,6 @@ async fn native_fleet_member() -> Result<()> {
     } else {
         vault.refresh_local().await?
     };
-    let delivery = traces
-        .as_ref()
-        .map(|traces| {
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                nddev_device_sync_accounts::telemetry::Delivery::start(
-                    identity.clone(),
-                    logger.control.subscribe()?,
-                    traces.subscribe()?,
-                    true,
-                ),
-            )
-        })
-        .transpose()?;
     if epoch == 1 {
         assert_eq!(view.pending, 1);
         let expected: BTreeMap<String, String> =
@@ -485,8 +459,10 @@ async fn native_fleet_member() -> Result<()> {
                         assert!((1..=32).contains(&round));
                         let data = expected_values(count, true, true, round)
                             .into_iter()
-                            .find(|data| matches!(data, ObservationData::Repository { repository }
-                                if repository.id.value() == 65 + index as u64))
+                            .find(|data| {
+                                matches!(data, ObservationData::Repository { repository }
+                                if repository.id.value() == 65 + index as u64)
+                            })
                             .ok_or("missing generated repository")?;
                         queue(&vault, data).await?;
                         let view = drain(&vault).await?;
@@ -528,21 +504,9 @@ async fn native_fleet_member() -> Result<()> {
                                 count
                             );
                         }
-                        let telemetry = if let Some(delivery) = &delivery {
-                            let state = delivery.flush().await;
-                            Some(json!({
-                                "enabled":matches!(state.policy, nddev_device_sync_accounts::telemetry::ExportPolicy::Enabled),
-                                "events":state.delivered,"spans":state.spans_delivered,
-                                "pending":state.pending+state.spans_pending,
-                                "dropped":state.dropped+state.spans_dropped,
-                                "failures":state.failures+state.spans_failures,
-                            }))
-                        } else {
-                            None
-                        };
-                        // All credentials belong to disposable per-client
-                        // keyrings and are removed by the owned supervisor.
-                        Ok(json!({"finished":true,"telemetry":telemetry}))
+                        // Per-client keyrings outlive both library processes so
+                        // the owned supervisor can qualify the actual NDS CLI.
+                        Ok(json!({"finished":true}))
                     }
                     _ => Err("unknown fleet action".into()),
                 }
@@ -560,10 +524,6 @@ async fn native_fleet_member() -> Result<()> {
     }
     drop(vault);
     drop(identity);
-    drop(delivery);
-    if let Some(traces) = traces {
-        traces.shutdown();
-    }
     logger.shutdown();
     let output = logger.control.output_health();
     assert_eq!(
