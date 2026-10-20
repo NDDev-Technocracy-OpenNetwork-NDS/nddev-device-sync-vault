@@ -184,9 +184,9 @@ journal under their Web Lock. Upgrade consumers together and preserve active
 drafts while replacing old processes and tabs.
 
 An authenticated capacity refusal retains the observed history head/floor beside
-the exact dispatched original. A newly elected native owner restores Core's
-upload policy from those facts; follower reads and successful inbox reads cannot
-clear it. Explicit synchronization retries clear only this refusal metadata,
+the exact dispatched original. A newly elected native owner or restarted browser
+task restores Core's upload policy from those facts before its first batch;
+follower reads and successful inbox reads cannot clear it. Explicit synchronization retries clear only this refusal metadata,
 preserving the original ciphertext, operation ID and terminal Unknown reasons.
 The schema 7 to 8 transition adds metadata without rewriting encrypted state.
 `just capacity-owner-acceptance` fills the unchanged production entity quota in

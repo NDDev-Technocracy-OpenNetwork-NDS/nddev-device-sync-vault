@@ -262,7 +262,6 @@ impl VaultClient {
     pub(crate) async fn drain_replica(&self) -> Result<(), Error> {
         self.journal.drain().await
     }
-    #[cfg(not(target_arch = "wasm32"))]
     async fn replica_snapshot(&self) -> Result<crate::journal::ReplicaSnapshot, Error> {
         match self
             .journal
@@ -273,7 +272,6 @@ impl VaultClient {
             _ => Err(Error::Invalid),
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn restored_replica_schedule(
         &self,
     ) -> Result<nddev_device_sync_application::lifecycle::ReplicaSchedule, Error> {

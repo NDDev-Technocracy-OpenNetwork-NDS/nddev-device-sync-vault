@@ -75,6 +75,8 @@ impl ReplicaTask {
             let mut ownership = None;
             #[cfg(not(target_arch = "wasm32"))]
             let mut observation: Option<crate::client::ReplicaObservation> = None;
+            #[cfg(target_arch = "wasm32")]
+            let mut restored_schedule = false;
             loop {
                 if !enabled.borrow().active {
                     if enabled.changed().await.is_err() {
@@ -107,42 +109,9 @@ impl ReplicaTask {
                             .await
                             .map_err(replica_auth_error)?;
                         #[cfg(not(target_arch = "wasm32"))]
-                        if ownership.is_none() {
+                        let lease = if ownership.is_none() {
                             match vault.replica_owner().await {
-                                Ok(lease) => {
-                                    // A new elected lifetime restores only actual journal
-                                    // refusal facts. GUI attachment/resume cannot clear them.
-                                    let restored = Arc::new(Mutex::new(
-                                        vault.restored_replica_schedule().await?,
-                                    ));
-                                    let fence = identity
-                                        .local_use_fence_from(&lifetime)
-                                        .await
-                                        .map_err(replica_auth_error)?;
-                                    {
-                                        let _publication = publication
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner());
-                                        identity
-                                            .check_local_use_lifetime(&fence)
-                                            .map_err(replica_auth_error)?;
-                                        let mut current = policy_slot
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner());
-                                        if !Arc::ptr_eq(&current, &schedule) {
-                                            return Err(VaultError::Cancelled);
-                                        }
-                                        *current = restored.clone();
-                                        schedule = restored;
-                                    }
-                                    ownership = Some(lease);
-                                    acquired.store(true, std::sync::atomic::Ordering::Release);
-                                    tracing::info!(
-                                        event.name = "sync.replica.owner",
-                                        module = "vault",
-                                        outcome = "ok"
-                                    );
-                                }
+                                Ok(lease) => Some(lease),
                                 Err(VaultError::Busy) => {
                                     if observation.as_ref().is_none_or(|value| value.expired()) {
                                         observation =
@@ -160,6 +129,52 @@ impl ReplicaTask {
                                     return Ok(observed.view);
                                 }
                                 Err(error) => return Err(error),
+                            }
+                        } else {
+                            None
+                        };
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let restore = lease.is_some();
+                        #[cfg(target_arch = "wasm32")]
+                        let restore = !restored_schedule;
+                        if restore {
+                            // Restore durable refusal facts before the first batch on
+                            // every platform. Reload/attachment is not a user retry.
+                            let restored =
+                                Arc::new(Mutex::new(vault.restored_replica_schedule().await?));
+                            let fence = identity
+                                .local_use_fence_from(&lifetime)
+                                .await
+                                .map_err(replica_auth_error)?;
+                            {
+                                let _publication = publication
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                identity
+                                    .check_local_use_lifetime(&fence)
+                                    .map_err(replica_auth_error)?;
+                                let mut current = policy_slot
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if !Arc::ptr_eq(&current, &schedule) {
+                                    return Err(VaultError::Cancelled);
+                                }
+                                *current = restored.clone();
+                                schedule = restored;
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                ownership = lease;
+                                acquired.store(true, std::sync::atomic::Ordering::Release);
+                                tracing::info!(
+                                    event.name = "sync.replica.owner",
+                                    module = "vault",
+                                    outcome = "ok"
+                                );
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                restored_schedule = true;
                             }
                         }
                         let probe = {
