@@ -76,6 +76,15 @@ pub(crate) struct ObservationEnqueueGuard<'a> {
     pub selected: &'a nddev_device_sync_domain::repositories::catalog::CredentialSelection,
     pub selected_operation: &'a [u8],
     pub resolution: Option<&'a ResolutionGuard>,
+    pub binding: Option<&'a CatalogBinding>,
+}
+/// Encrypted owner intent and this installation's consent captured before I/O.
+/// Receipts may change metadata, but a distinct edit never keeps these bytes.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CatalogBinding {
+    pub source: Vec<u8>,
+    pub module_id: String,
+    pub module: Vec<u8>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ObservationResolution {

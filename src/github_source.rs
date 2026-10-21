@@ -14,6 +14,88 @@ pub struct GithubSourceSetting {
 }
 
 impl VaultClient {
+    /// Capture saved owner intent and device consent together, before provider
+    /// I/O. The same encrypted witnesses remain required at every use and write.
+    pub async fn capture_configured_repository_observations(
+        &self,
+        required: &std::collections::BTreeSet<nddev_device_sync_domain::Permission>,
+        fence: Arc<nddev_device_sync_accounts::LocalUseFence>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<RepositoryRead, Error> {
+        let _permit = self.admitted()?;
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let module_id = self.module_configuration_id("gds")?;
+        let (source, module) = match self
+            .journal
+            .call(crate::storage::Command::CatalogContext {
+                module_id: module_id.clone(),
+            })
+            .await?
+        {
+            crate::storage::Reply::CatalogContext(source, module) => (source, module),
+            _ => return Err(Error::Invalid),
+        };
+        let source = source.ok_or(Error::SelectionChanged)?;
+        let module = module.ok_or(Error::Cancelled)?;
+        if source.conflicted || module.conflicted {
+            return Err(Error::Busy);
+        }
+        let source_snapshot = self.decrypt_state_snapshot(
+            &key,
+            EntityKind::RepositoryState,
+            SOURCE_ENTITY_ID,
+            &source.body,
+        )?;
+        let State::GithubSource {
+            selection: Some(selection),
+        } = source_snapshot.data
+        else {
+            return Err(Error::SelectionChanged);
+        };
+        let module_snapshot =
+            self.decrypt_state_snapshot(&key, EntityKind::ModuleState, &module_id, &module.body)?;
+        let State::ModuleConfiguration { configuration, .. } = module_snapshot.data else {
+            return Err(Error::Invalid);
+        };
+        configuration
+            .admit(true, true, required)
+            .map_err(|_| Error::Cancelled)?;
+        let binding = crate::journal::CatalogBinding {
+            source: source.body,
+            module_id,
+            module: module.body,
+        };
+        // Release ordinary command admission before the existing bounded capture.
+        drop(_permit);
+        self.capture_repository_observations_inner(selection, fence, cancellation, Some(binding))
+            .await
+    }
+
+    fn decrypt_state_snapshot(
+        &self,
+        key: &VaultKey,
+        kind: EntityKind,
+        id: &str,
+        body: &[u8],
+    ) -> Result<Snapshot, Error> {
+        let operation = codec::versioned(body)?;
+        if operation.operation.entity_kind != kind || operation.operation.entity_id != id {
+            return Err(Error::Invalid);
+        }
+        let bytes = key.decrypt_versioned(&self.scope, &operation)?;
+        let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
+        snapshot
+            .validate(&operation.operation.device, kind, id)
+            .map_err(|_| Error::Invalid)?;
+        Ok(snapshot)
+    }
     /// Read encrypted owner intent. An absent/conflicted/stale reference grants
     /// nothing; the consumer must check the protected record at point of use.
     pub async fn github_source(&self) -> Result<GithubSourceSetting, Error> {
@@ -39,15 +121,12 @@ impl VaultClient {
             });
         };
         let operation = codec::versioned(&entity.body)?;
-        let bytes = key.decrypt_versioned(&self.scope, &operation)?;
-        let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
-        snapshot
-            .validate(
-                &operation.operation.device,
-                operation.operation.entity_kind,
-                SOURCE_ENTITY_ID,
-            )
-            .map_err(|_| Error::Invalid)?;
+        let snapshot = self.decrypt_state_snapshot(
+            &key,
+            EntityKind::RepositoryState,
+            SOURCE_ENTITY_ID,
+            &entity.body,
+        )?;
         let State::GithubSource { selection } = snapshot.data else {
             return Err(Error::Invalid);
         };
@@ -109,6 +188,7 @@ impl VaultClient {
                 operation: entity.body,
                 fence: fence.clone(),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                binding: None,
             })
         } else {
             None
@@ -199,12 +279,35 @@ mod tests {
                 vault.set_github_source(None, 0, None).await,
                 Err(Error::Busy)
             ));
+            let required = std::collections::BTreeSet::from([
+                nddev_device_sync_domain::Permission::ReadOnly,
+                nddev_device_sync_domain::Permission::CredentialStore,
+                nddev_device_sync_domain::Permission::LocalNetwork,
+            ]);
+            let fence = Arc::new(identity.local_use_fence().await.map_err(identity_failure)?);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            assert!(matches!(
+                vault.capture_configured_repository_observations(&required, fence.clone(), cancellation.clone()).await,
+                Err(Error::Cancelled)
+            ));
+            let enabled = nddev_device_sync_domain::modules::control::Configuration {
+                enabled: true, permissions: required.clone(),
+            };
+            vault.set_module_configuration("gds".into(), 0, None, enabled.clone()).await?;
+            let configured = vault.capture_configured_repository_observations(&required, fence, cancellation).await?;
+            assert_eq!(configured.selection(), &selected);
             crate::client::catalog_acceptance::settle(&vault).await?;
             let committed = vault.github_source().await?;
             assert_eq!(committed.revision, 1);
             assert!(committed.pending_id.is_none() && !committed.conflicted);
             assert_eq!(committed.operation_id.as_ref(), Some(&receipt.operation_id));
             assert!(vault.repository_observation(&read, &repository).await?.value.is_none());
+            vault.validate_repository_read(&configured).await?;
+            let disabled = vault.set_module_configuration("gds".into(), 1, None, Default::default()).await?;
+            assert!(matches!(vault.validate_repository_read(&configured).await, Err(Error::SelectionChanged)));
+            vault.set_module_configuration("gds".into(), 1, Some(disabled), enabled).await?;
+            // Re-enabling cannot resurrect a read from an earlier consent edit.
+            assert!(matches!(vault.validate_repository_read(&configured).await, Err(Error::SelectionChanged)));
             assert_eq!(
                 vault.native_secret_at(&selected).await?.as_str(),
                 "SYNTHETIC_SOURCE_CANARY"
