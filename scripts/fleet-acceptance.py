@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Qualify real isolated Linux NDS clients; never resets product quotas or clocks."""
 from pathlib import Path
-import argparse,gzip,json,os,re,secrets,shutil,signal,socket,subprocess,sys,tempfile,time
+import argparse,gzip,hashlib,json,os,re,secrets,shutil,signal,socket,sqlite3,subprocess,sys,tempfile,time
 
 ROOT=Path(__file__).resolve().parents[1]
 TEST='client::fleet_acceptance::native_fleet_member'
@@ -42,6 +42,28 @@ def worker(root,executable,index,count,output):
                 raw.unlink()
                 if status:raise RuntimeError(f'Client {index} epoch {epoch} exited {status}')
                 child=None
+            if selected:=os.environ.get('NDS_FLEET_AGENT_RECEIPT'):
+                agent=json.loads(Path(selected).read_text())
+                fixture=json.loads(Path(os.environ['NDS_FIXTURE_RECEIPT']).read_text())
+                raw=output/f'agent-{index}.raw'
+                with (output/f'agent-{index}.stdout.json').open('xb') as stdout,raw.open('xb') as stderr:
+                    child=subprocess.Popen([agent['binary'],'--server',fixture['base_url'],'vault','list'],stdout=stdout,stderr=stderr)
+                    status=child.wait(timeout=180)
+                data=json.loads((output/f'agent-{index}.stdout.json').read_text())
+                assert status==0 and data['operation']=='vault.list' and data['pending']==0 and data['last_sync_at']>0,data
+                observed=data['diagnostics']
+                assert observed['export']=='enabled' and observed['acknowledged_events']>0 and observed['acknowledged_spans']>0,observed
+                assert observed['undelivered']==observed['dropped']==0,observed
+                databases=list((root/'state/nddev-device-sync/sync').glob('*.db'))
+                assert len(databases)==1
+                with sqlite3.connect(databases[0].as_uri()+'?mode=ro',uri=True) as database:
+                    facts=database.execute("SELECT count(*) FROM v3_entities WHERE kind='repository_state'").fetchone()[0]
+                assert facts==1056,'Actual CLI did not restore the complete catalog'
+                with raw.open('rb') as source,gzip.open(output/f'agent-{index}.log.gz','wb',compresslevel=1) as destination:
+                    shutil.copyfileobj(source,destination,65536)
+                raw.unlink()
+                (output/f'agent-{index}-proof.json').write_text(json.dumps({'source':agent['source'],'repositories':1024,'facts':facts,'diagnostics':observed})+'\n')
+                child=None
         finally:
             if child is not None and child.poll() is None:
                 child.terminate()
@@ -58,6 +80,8 @@ parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--fixture',type=Path,required=True)
 parser.add_argument('--output',type=Path,required=True)
 parser.add_argument('--clients',type=int,choices=range(2,33),default=32)
+parser.add_argument('--rounds',type=int,choices=range(0,33),default=8)
+parser.add_argument('--agent-receipt',type=Path,help='Qualify a real immutable NDS CLI build over the same owned native identities and a fresh replica')
 args=parser.parse_args()
 assert sys.platform=='linux' and args.fixture.is_absolute() and args.output.is_absolute()
 assert not args.output.resolve().is_relative_to(ROOT) and not args.output.exists()
@@ -68,6 +92,13 @@ source=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).st
 dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip())
 if args.clients==32 and dirty:raise SystemExit('Full fleet qualification requires a committed source')
 assert shutil.disk_usage(args.output).free>=4*1024**3,'Fleet artifacts require 4 GiB free'
+agent=None
+if args.agent_receipt:
+    assert args.agent_receipt.is_absolute() and args.agent_receipt.is_file()
+    agent=json.loads(args.agent_receipt.read_text());binary=Path(agent['binary'])
+    assert binary.is_absolute() and binary.is_file() and binary.stat().st_size<=128*1024**2
+    assert re.fullmatch('[a-f0-9]{40}',agent['source'])
+    assert hashlib.sha256(binary.read_bytes()).hexdigest()==agent['sha256']
 # Build first; the runtime uses only this selected test executable.
 env=os.environ|{'CARGO_PROFILE_TEST_OPT_LEVEL':'3'}
 with (args.output/'build.log').open('w') as log:
@@ -159,6 +190,7 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
             env={k:v for k,v in os.environ.items() if k in ['PATH','HOME','LANG','LC_ALL','LD_LIBRARY_PATH']}
             env.update({k:str(root/v) for k,v in [('XDG_DATA_HOME','data'),('XDG_STATE_HOME','state'),('XDG_CONFIG_HOME','config'),('XDG_CACHE_HOME','cache'),('XDG_RUNTIME_DIR','runtime')]})
             env.update({'NDS_FLEET_ROOT':str(root),'NDS_FLEET_INDEX':str(index),'NDS_FLEET_COUNT':str(args.clients),'NDS_FLEET_SOCKET':str(base/'control.sock'),'NDS_FLEET_TOKEN_SOCKET':str(base/'session.sock'),'NDS_FIXTURE_RECEIPT':str(args.fixture),'NDS_FLEET_SOURCE':'unknown' if dirty else source})
+            if args.agent_receipt:env['NDS_FLEET_AGENT_RECEIPT']=str(args.agent_receipt)
             log=(args.output/f'supervisor-{index}.log').open('wb')
             try:processes.append(subprocess.Popen(['dbus-run-session','--',sys.executable,__file__,'--worker',str(root),executable,str(index),str(args.clients),str(args.output)],env=env,stdout=log,stderr=log,start_new_session=True))
             finally:log.close()
@@ -207,9 +239,17 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
             assert value==ready[index];restored[index]=value
         event('cold_offline_restored',clients=args.clients)
         mode('online');all_clients('drain');final=all_clients('inspect',updated=True,offline=True);uniform(final)
-        for index in range(1,args.clients):send(index,'finish');assert read(index)['finished']
-        for index in range(1,args.clients):assert processes[index].wait(timeout=10)==0
-        send(0,'finish');assert read(0)['finished'];assert processes[0].wait(timeout=10)==0
+        for round in range(1,args.rounds+1):
+            started=time.monotonic()
+            all_clients('sustain',round=round)
+            final=all_clients('inspect',updated=True,offline=True,round=round);uniform(final)
+            cursor=final[0]['cursor']
+            unchanged=all_clients('unchanged',updated=True,offline=True,round=round)
+            assert all(value['unchanged'] and value['cursor']==cursor for value in unchanged)
+            event('sustained_round',round=round,seconds=float(f'{time.monotonic()-started:.3f}'),cursor=cursor)
+        for index in range(args.clients):send(index,'finish');assert read(index)['finished']
+        for process in processes:assert process.wait(timeout=180 if agent else 10)==0
+        deliveries=[json.loads((args.output/f'agent-{index}-proof.json').read_text())for index in range(args.clients)]if agent else []
         captured=[]
         for path in sorted(args.output.glob('client-*.log.gz')):
             sequence=0;events=0;instance=None
@@ -218,7 +258,7 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
                     if len(line)>65536:raise RuntimeError('Log record exceeded its bound')
                     try:value=json.loads(line)
                     except json.JSONDecodeError:continue
-                    if not isinstance(value,dict) or value.get('service.name')!='nds-fleet-acceptance':continue
+                    if not isinstance(value,dict) or value.get('service.name')!='nddev-device-sync-client':continue
                     assert value['producer.sequence']==sequence+1
                     sequence=value['producer.sequence'];events+=1
                     instance=instance or value['producer.instance_id'];assert instance==value['producer.instance_id']
@@ -226,7 +266,7 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
                     assert value['event.name'] not in ['logging.event.rejected','logging.fields.rejected']
             assert events>0
             captured.append({'file':path.name,'events':events,**json.loads(path.with_name(path.name.replace('.log.gz','-capture.json')).read_text())})
-        proof={'captured':captured,'source':source,'dirty_source':dirty,'clients':args.clients,'repositories':1024,'owners':32,'native_processes':args.clients*2,'final':final[0],'phases':history,'scope':'Real Rust clients, separate Secret Service/SQLite, genuine restored fixture session, real HTTP/PostgreSQL; generated catalog inputs, not GitHub-provider acceptance.'}
+        proof={'captured':captured,'source':source,'dirty_source':dirty,'clients':args.clients,'repositories':1024,'owners':32,'native_processes':args.clients*(3 if agent else 2),'rounds':args.rounds,'agent':agent,'telemetry':deliveries,'final':final[0],'phases':history,'scope':'One generated NDS account,32 GitHub catalog owners; real Rust clients, separate Secret Service/SQLite, genuine restored fixture session, real HTTP/PostgreSQL. Optional actual NDS CLI restores its own complete journal and exports signed logs/native spans. Library-test local logs do not claim authenticated client provenance or native cross-process offline log retention. Generated catalog inputs are not GitHub-provider acceptance.'}
         (args.output/'receipt.json').write_text(json.dumps(proof,indent=2)+'\n');event('complete',clients=args.clients)
     finally:
         for connection in sockets.values():connection.close()

@@ -27,7 +27,7 @@ pub struct NativeReplica {
     stopping: AtomicBool,
     stopped: AtomicBool,
     client_version: Option<String>,
-    delivery: Mutex<Option<nddev_device_sync_accounts::telemetry::Delivery>>,
+    delivery: Mutex<Option<Arc<nddev_device_sync_accounts::telemetry::Delivery>>>,
 }
 
 impl NativeReplica {
@@ -173,8 +173,15 @@ impl NativeReplica {
             .unwrap_or_else(|error| error.into_inner());
         if delivery.as_ref().is_none_or(|delivery| delivery.finished()) {
             delivery.take();
-            *delivery = start(self.identity.clone());
+            *delivery = start(self.identity.clone()).map(Arc::new);
         }
+    }
+    /// The existing sender, shared for bounded graceful-process flushing.
+    pub fn delivery_handle(&self) -> Option<Arc<nddev_device_sync_accounts::telemetry::Delivery>> {
+        self.delivery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
     pub fn delivery_snapshot(&self) -> nddev_device_sync_accounts::view::DeliveryView {
         self.delivery
@@ -317,13 +324,7 @@ impl NativeReplica {
         if !self.stopping.swap(true, Ordering::AcqRel) {
             self.identity.cancel();
         }
-        let _control = runtime::timeout(
-            nddev_device_sync_application::replica::BATCH_DEADLINE,
-            self.control.lock(),
-        )
-        .await
-        .map_err(|_| Error::Busy)?;
-        self.stop_task().await?;
+        self.stop_replication().await?;
         self.delivery
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -336,6 +337,17 @@ impl NativeReplica {
             );
         }
         Ok(())
+    }
+    /// Graceful process exit drains data work before flushing the same sender.
+    /// Authority remains valid until the subsequent full stop or revocation.
+    pub async fn stop_replication(&self) -> Result<(), Error> {
+        let _control = runtime::timeout(
+            nddev_device_sync_application::replica::BATCH_DEADLINE,
+            self.control.lock(),
+        )
+        .await
+        .map_err(|_| Error::Busy)?;
+        self.stop_task().await
     }
     pub async fn shutdown() -> Result<(), Error> {
         let mut selected = runtime::timeout(
