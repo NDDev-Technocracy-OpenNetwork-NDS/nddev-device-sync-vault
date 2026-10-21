@@ -19,6 +19,7 @@ impl VaultClient {
     pub async fn capture_configured_repository_observations(
         &self,
         required: &std::collections::BTreeSet<nddev_device_sync_domain::Permission>,
+        expected_source_operation: &str,
         fence: Arc<nddev_device_sync_accounts::LocalUseFence>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<RepositoryRead, Error> {
@@ -43,6 +44,9 @@ impl VaultClient {
             _ => return Err(Error::Invalid),
         };
         let source = source.ok_or(Error::SelectionChanged)?;
+        if codec::versioned(&source.body)?.operation.id != expected_source_operation {
+            return Err(Error::SelectionChanged);
+        }
         let module = module.ok_or(Error::Cancelled)?;
         if source.conflicted || module.conflicted {
             return Err(Error::Busy);
@@ -287,14 +291,15 @@ mod tests {
             let fence = Arc::new(identity.local_use_fence().await.map_err(identity_failure)?);
             let cancellation = tokio_util::sync::CancellationToken::new();
             assert!(matches!(
-                vault.capture_configured_repository_observations(&required, fence.clone(), cancellation.clone()).await,
+                vault.capture_configured_repository_observations(&required, &receipt.operation_id, fence.clone(), cancellation.clone()).await,
                 Err(Error::Cancelled)
             ));
             let enabled = nddev_device_sync_domain::modules::control::Configuration {
                 enabled: true, permissions: required.clone(),
             };
             vault.set_module_configuration("gds".into(), 0, None, enabled.clone()).await?;
-            let configured = vault.capture_configured_repository_observations(&required, fence, cancellation).await?;
+            assert!(matches!(vault.capture_configured_repository_observations(&required, "obsolete-source-operation", fence.clone(), cancellation.clone()).await, Err(Error::SelectionChanged)));
+            let configured = vault.capture_configured_repository_observations(&required, &receipt.operation_id, fence, cancellation).await?;
             assert_eq!(configured.selection(), &selected);
             crate::client::catalog_acceptance::settle(&vault).await?;
             let committed = vault.github_source().await?;
