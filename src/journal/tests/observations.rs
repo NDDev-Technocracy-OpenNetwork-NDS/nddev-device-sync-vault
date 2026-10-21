@@ -1,4 +1,5 @@
 use super::*;
+mod binding;
 mod capacity;
 mod scoped_resolution;
 mod source;

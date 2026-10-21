@@ -21,7 +21,7 @@ pub struct ModuleMutation {
 }
 
 impl VaultClient {
-    fn module_configuration_id(&self, module: &str) -> Result<String, Error> {
+    pub(super) fn module_configuration_id(&self, module: &str) -> Result<String, Error> {
         nddev_device_sync_domain::ModuleId::new(module).map_err(|_| Error::Invalid)?;
         if module.contains(':') {
             return Err(Error::Invalid);

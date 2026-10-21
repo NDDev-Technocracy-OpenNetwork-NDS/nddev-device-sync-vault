@@ -76,6 +76,7 @@ impl Journal {
                 selected,
                 selected_operation,
                 resolution: None,
+                binding: None,
             }),
             Some(writer),
         )
@@ -101,6 +102,7 @@ impl Journal {
                 selected: source.0,
                 selected_operation: source.1,
                 resolution: Some(resolution),
+                binding: None,
             }),
             Some(writer),
         )
@@ -119,6 +121,26 @@ impl Journal {
             expected_revision,
             expected_pending,
             None,
+            Some(writer),
+        )
+    }
+    pub(crate) fn enqueue_catalog_observation(
+        &self,
+        body: Vec<u8>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        source: ObservationEnqueueGuard<'_>,
+        writer: &WriterEnqueueGuard,
+    ) -> Result<Enqueued, Error> {
+        if source.binding.is_none() {
+            return Err(Error::Invalid);
+        }
+        self.enqueue_checked(
+            body,
+            source.resolution.map(|guard| guard.cursor),
+            expected_revision,
+            expected_pending,
+            Some(source),
             Some(writer),
         )
     }
@@ -145,6 +167,9 @@ impl Journal {
         if let Some(observation) = &selected {
             if kind != "repository_state" {
                 return Err(Error::Invalid);
+            }
+            if let Some(binding) = observation.binding {
+                reads::catalog_binding_current(&tx, binding)?;
             }
             let source = reads::selected_current(&tx, observation.selected)?;
             if source.body != observation.selected_operation {
