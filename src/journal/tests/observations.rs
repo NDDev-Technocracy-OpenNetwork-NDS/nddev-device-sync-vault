@@ -1,6 +1,7 @@
 use super::*;
 mod capacity;
 mod scoped_resolution;
+mod source;
 use nddev_device_sync_domain::{
     repositories::catalog::{observations::*, *},
     state::{Snapshot, State},

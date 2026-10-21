@@ -30,6 +30,7 @@ struct Expected {
     pending: Option<String>,
     observed_base: Option<u64>,
     observation: Option<repository::SourceGuard>,
+    fence: Option<Arc<nddev_device_sync_accounts::LocalUseFence>>,
 }
 enum ReadRecord {
     Legacy(Record),
@@ -491,12 +492,16 @@ impl VaultClient {
         if plaintext.len() > MAX_PLAIN_BYTES {
             return Err(Error::Invalid);
         }
-        let fence = match expected.as_ref().and_then(|e| e.observation.as_ref()) {
-            Some(source) => {
+        let fence = match (
+            expected.as_ref().and_then(|e| e.observation.as_ref()),
+            expected.as_ref().and_then(|e| e.fence.as_ref()),
+        ) {
+            (Some(source), _) => {
                 source.check()?;
                 source.fence.clone()
             }
-            None => Arc::new(
+            (None, Some(fence)) => fence.clone(),
+            (None, None) => Arc::new(
                 self.identity
                     .local_use_fence()
                     .await
@@ -675,10 +680,10 @@ impl VaultClient {
             .call_guarded(command, || {
                 if let Some(source) = expected.as_ref().and_then(|e| e.observation.as_ref()) {
                     source.check()?;
-                    self.identity
-                        .check_local_use_lifetime(&source.fence)
-                        .map_err(identity_failure)?;
                 }
+                self.identity
+                    .check_local_use_lifetime(&fence)
+                    .map_err(identity_failure)?;
                 Ok(())
             })
             .await?
@@ -793,6 +798,7 @@ impl VaultClient {
                 pending: expected_pending,
                 observed_base: None,
                 observation: None,
+                fence: None,
             }),
         )
         .await
@@ -1009,6 +1015,7 @@ impl VaultClient {
                 pending: expected_pending,
                 observed_base: None,
                 observation: None,
+                fence: None,
             }),
         )
         .await
@@ -1049,6 +1056,7 @@ impl VaultClient {
                 pending: expected_pending,
                 observed_base: None,
                 observation: None,
+                fence: None,
             }),
         )
         .await
@@ -1128,10 +1136,14 @@ impl VaultClient {
             .entity("vault_record", id)
             .await?
             .ok_or(missing_or_deleted)?;
+        let operation = codec::versioned(&entity.body)?;
         if entity.conflicted
             || selection.is_some_and(|selected| {
-                entity.revision != selected.revision()
-                    || entity.pending_id.as_deref() != selected.pending_id()
+                !selected.matches_record(
+                    &operation.operation,
+                    entity.revision,
+                    entity.pending_id.as_deref(),
+                )
             })
         {
             return Err(if selection.is_some() {
@@ -1310,9 +1322,12 @@ impl VaultClient {
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             if snapshots.is_empty()
                 || snapshots.len() > 32
-                || snapshots
-                    .iter()
-                    .any(|snapshot| matches!(snapshot.data, State::ModuleConfiguration { .. }))
+                || snapshots.iter().any(|snapshot| {
+                    matches!(
+                        snapshot.data,
+                        State::ModuleConfiguration { .. } | State::GithubSource { .. }
+                    )
+                })
             {
                 return Err(Error::Invalid);
             }
@@ -1346,7 +1361,9 @@ impl VaultClient {
         let mut prepared = Vec::new();
         for snapshot in snapshots {
             let (kind, id) = match &snapshot.data {
-                State::Repository { .. } => return Err(Error::Invalid),
+                State::Repository { .. } | State::GithubSource { .. } => {
+                    return Err(Error::Invalid);
+                }
                 State::Device { .. } => (EntityKind::DeviceState, self.scope.device.clone()),
                 State::Module { module_id, .. } => (
                     EntityKind::ModuleState,
@@ -1461,7 +1478,9 @@ impl VaultClient {
                 conflicted: entity.conflicted,
             };
             match snapshot.data {
-                State::Repository { .. } => return Err(Error::Invalid),
+                State::Repository { .. } | State::GithubSource { .. } => {
+                    return Err(Error::Invalid);
+                }
                 State::Device {
                     display_name,
                     platform,
@@ -2318,8 +2337,11 @@ pub use repository::{
     RepositoryResolution, RetainedRepositoryObservation,
 };
 
+#[path = "github_source.rs"]
+mod github_source;
 #[path = "module_client.rs"]
 mod module;
+pub use github_source::GithubSourceSetting;
 pub use module::{ModuleMutation, ModuleSetting};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

@@ -600,6 +600,7 @@ impl VaultClient {
                     observed_base: Some(resolution.current.version.next_base),
                     resolution: Some(resolution.guard.clone()),
                     observation: Some(read.source.clone()),
+                    fence: None,
                 }),
             )
             .await?;
@@ -705,6 +706,7 @@ impl VaultClient {
                     resolution: None,
                     observed_base: Some(expected.next_base),
                     observation: Some(read.source.clone()),
+                    fence: None,
                 }),
             )
             .await?;

@@ -130,6 +130,7 @@ impl VaultClient {
                     resolution: None,
                     observed_base: None,
                     observation: None,
+                    fence: None,
                 }),
             )
             .await?;
