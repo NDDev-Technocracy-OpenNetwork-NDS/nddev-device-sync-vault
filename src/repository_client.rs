@@ -16,6 +16,7 @@ pub(super) struct SourceGuard {
     pub(super) operation: Vec<u8>,
     pub(super) fence: Arc<LocalUseFence>,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
+    pub(super) binding: Option<crate::journal::CatalogBinding>,
 }
 impl SourceGuard {
     pub(super) fn check(&self) -> Result<(), Error> {
@@ -35,6 +36,9 @@ pub struct RepositoryRead {
     writer_mode: Option<replica::WriterMode>,
 }
 impl RepositoryRead {
+    pub fn selection(&self) -> &CredentialSelection {
+        &self.source.selection
+    }
     /// Mechanical stored IDs; Core owns canonical key decoding and capture.
     pub fn baselines(&self) -> Vec<(String, TargetVersion)> {
         self.targets
@@ -352,6 +356,16 @@ impl VaultClient {
         fence: Arc<LocalUseFence>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<RepositoryRead, Error> {
+        self.capture_repository_observations_inner(selection, fence, cancellation, None)
+            .await
+    }
+    pub(super) async fn capture_repository_observations_inner(
+        &self,
+        selection: CredentialSelection,
+        fence: Arc<LocalUseFence>,
+        cancellation: tokio_util::sync::CancellationToken,
+        binding: Option<crate::journal::CatalogBinding>,
+    ) -> Result<RepositoryRead, Error> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -368,13 +382,16 @@ impl VaultClient {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let raw = match self
-            .journal
-            .call(crate::storage::Command::ObservationBaselines {
+        let command = match &binding {
+            Some(binding) => crate::storage::Command::CatalogBaselines {
                 selected: selection.clone(),
-            })
-            .await?
-        {
+                binding: binding.clone(),
+            },
+            None => crate::storage::Command::ObservationBaselines {
+                selected: selection.clone(),
+            },
+        };
+        let raw = match self.journal.call(command).await? {
             crate::storage::Reply::ObservationBaselines(value) => value,
             _ => return Err(Error::Invalid),
         };
@@ -413,34 +430,54 @@ impl VaultClient {
                 operation: raw.selected_operation,
                 fence,
                 cancellation,
+                binding,
             },
             targets,
             writer_mode,
         })
     }
 
-    async fn validate_repository_read(&self, read: &RepositoryRead) -> Result<(), Error> {
+    pub async fn validate_repository_read(&self, read: &RepositoryRead) -> Result<(), Error> {
+        let _permit = self.admitted()?;
+        self.validate_repository_read_inner(read).await
+    }
+    async fn validate_repository_read_inner(&self, read: &RepositoryRead) -> Result<(), Error> {
         read.source.check()?;
         self.identity
             .validate_local_use(&read.source.fence)
             .await
             .map_err(identity_failure)?;
         read.source.check()?;
-        let current = self
-            .journal
-            .entity("vault_record", read.source.selection.record_ref())
-            .await?
-            .ok_or(Error::SelectionChanged)?;
-        let operation = codec::versioned(&current.body)?;
-        if current.conflicted
-            || !read.source.selection.matches_record(
-                &operation.operation,
-                current.revision,
-                current.pending_id.as_deref(),
-            )
-            || current.body != read.source.operation
-        {
-            return Err(Error::SelectionChanged);
+        if let Some(binding) = &read.source.binding {
+            match self
+                .journal
+                .call(crate::storage::Command::ValidateCatalogRead {
+                    selected: read.source.selection.clone(),
+                    selected_operation: read.source.operation.clone(),
+                    binding: binding.clone(),
+                })
+                .await?
+            {
+                crate::storage::Reply::Done => {}
+                _ => return Err(Error::Invalid),
+            }
+        } else {
+            let current = self
+                .journal
+                .entity("vault_record", read.source.selection.record_ref())
+                .await?
+                .ok_or(Error::SelectionChanged)?;
+            let operation = codec::versioned(&current.body)?;
+            if current.conflicted
+                || !read.source.selection.matches_record(
+                    &operation.operation,
+                    current.revision,
+                    current.pending_id.as_deref(),
+                )
+                || current.body != read.source.operation
+            {
+                return Err(Error::SelectionChanged);
+            }
         }
         read.source.check()?;
         let result = self
@@ -461,7 +498,7 @@ impl VaultClient {
     ) -> Result<RepositoryResolution, Error> {
         let _permit = self.admitted()?;
         expected.validate().map_err(|_| Error::Invalid)?;
-        self.validate_repository_read(&read).await?;
+        self.validate_repository_read_inner(&read).await?;
         let key = self.key().await?.ok_or(Error::Locked)?;
         let id = expected.entity_id();
         let raw = match self
@@ -503,7 +540,7 @@ impl VaultClient {
         }) {
             return Err(Error::Invalid);
         }
-        self.validate_repository_read(&read).await?;
+        self.validate_repository_read_inner(&read).await?;
         if raw.guard.repository_fingerprint.is_none() {
             return Err(Error::Invalid);
         }
@@ -628,7 +665,7 @@ impl VaultClient {
         expected: &ObservationKey,
     ) -> Result<ObservedTarget, Error> {
         expected.validate().map_err(|_| Error::Invalid)?;
-        self.validate_repository_read(read).await?;
+        self.validate_repository_read_inner(read).await?;
         let key = self.key().await?.ok_or(Error::Locked)?;
         let target = match self
             .journal
@@ -641,7 +678,7 @@ impl VaultClient {
             _ => return Err(Error::Invalid),
         };
         let current = decode_target(&self.scope, &key, expected, target)?;
-        self.validate_repository_read(read).await?;
+        self.validate_repository_read_inner(read).await?;
         Ok(current)
     }
 

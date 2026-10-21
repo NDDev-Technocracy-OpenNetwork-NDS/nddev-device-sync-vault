@@ -132,6 +132,30 @@ pub(crate) enum Command {
     ObservationBaselines {
         selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
     },
+    CatalogContext {
+        module_id: String,
+    },
+    CatalogBaselines {
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        binding: crate::journal::CatalogBinding,
+    },
+    ValidateCatalogRead {
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: Vec<u8>,
+        binding: crate::journal::CatalogBinding,
+    },
+    // This command requires all three encrypted witnesses. An older browser
+    // worker must reject it rather than drop a newly added authorization field.
+    EnqueueCatalogObservation {
+        body: Vec<u8>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: Vec<u8>,
+        binding: crate::journal::CatalogBinding,
+        writer: crate::journal::WriterEnqueueGuard,
+        resolution: Option<crate::journal::ResolutionGuard>,
+    },
     // A distinct IPC command makes older workers reject the combined guard
     // instead of silently ignoring an added field on the old command.
     EnqueueObservedWriter {
@@ -220,6 +244,10 @@ impl Command {
             Self::RepositoryPage { .. } => "vault.storage.repository_page",
             Self::RepositoryOwners { .. } => "vault.storage.repository_owners",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
+            Self::CatalogContext { .. } => "vault.storage.catalog_context",
+            Self::CatalogBaselines { .. } => "vault.storage.catalog_baselines",
+            Self::ValidateCatalogRead { .. } => "vault.storage.catalog_validate",
+            Self::EnqueueCatalogObservation { .. } => "vault.storage.catalog_enqueue",
             Self::EnqueueObservedWriter { .. } => "vault.storage.enqueue_observation",
             Self::EnqueueRepositoryResolution { .. } => "vault.storage.resolve_observation",
             Self::Entity { .. } => "vault.storage.entity",
@@ -265,6 +293,7 @@ pub(crate) enum Reply {
     Pending(Vec<Pending>),
     Cursor(u64),
     ObservationBaselines(ObservationBaselines),
+    CatalogContext(Option<Entity>, Option<Entity>),
     ObservationTarget(ObservationTarget),
     ObservationResolution(crate::journal::ObservationResolution),
     CatalogRows(crate::journal::CatalogRows),
@@ -280,6 +309,42 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
+        Command::CatalogContext { module_id } => {
+            let (source, module) = journal.catalog_context(&module_id)?;
+            Reply::CatalogContext(source, module)
+        }
+        Command::CatalogBaselines { selected, binding } => {
+            Reply::ObservationBaselines(journal.catalog_baselines(&selected, &binding)?)
+        }
+        Command::ValidateCatalogRead {
+            selected,
+            selected_operation,
+            binding,
+        } => {
+            journal.validate_catalog_read(&selected, &selected_operation, &binding)?;
+            Reply::Done
+        }
+        Command::EnqueueCatalogObservation {
+            body,
+            expected_revision,
+            expected_pending,
+            selected,
+            selected_operation,
+            binding,
+            writer,
+            resolution,
+        } => Reply::Enqueued(journal.enqueue_catalog_observation(
+            body,
+            expected_revision,
+            expected_pending,
+            crate::journal::ObservationEnqueueGuard {
+                selected: &selected,
+                selected_operation: &selected_operation,
+                resolution: resolution.as_ref(),
+                binding: Some(&binding),
+            },
+            &writer,
+        )?),
         Command::VersionedEntity { kind, id } => {
             let (entity, revision) = journal.versioned_entity(&kind, &id)?;
             Reply::VersionedEntity(entity, revision)

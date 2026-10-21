@@ -51,7 +51,55 @@ pub(super) fn selected_current(
     }
     Ok(record)
 }
+pub(super) fn catalog_binding_current(
+    connection: &Connection,
+    binding: &CatalogBinding,
+) -> Result<(), Error> {
+    use nddev_device_sync_domain::repositories::catalog::SOURCE_ENTITY_ID;
+    if !binding.module_id.ends_with(":gds:configuration") {
+        return Err(Error::Invalid);
+    }
+    for (kind, id, expected) in [
+        ("repository_state", SOURCE_ENTITY_ID, &binding.source),
+        ("module_state", binding.module_id.as_str(), &binding.module),
+    ] {
+        let current = entity(connection, kind, id)?.ok_or(Error::SelectionChanged)?;
+        if current.conflicted || current.body != *expected {
+            return Err(Error::SelectionChanged);
+        }
+    }
+    Ok(())
+}
 impl Journal {
+    pub(crate) fn catalog_context(
+        &self,
+        module_id: &str,
+    ) -> Result<(Option<Entity>, Option<Entity>), Error> {
+        self.read(|connection| {
+            Ok((
+                entity(
+                    connection,
+                    "repository_state",
+                    nddev_device_sync_domain::repositories::catalog::SOURCE_ENTITY_ID,
+                )?,
+                entity(connection, "module_state", module_id)?,
+            ))
+        })
+    }
+    pub(crate) fn validate_catalog_read(
+        &self,
+        selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: &[u8],
+        binding: &CatalogBinding,
+    ) -> Result<(), Error> {
+        self.read(|connection| {
+            catalog_binding_current(connection, binding)?;
+            if selected_current(connection, selected)?.body != selected_operation {
+                return Err(Error::SelectionChanged);
+            }
+            Ok(())
+        })
+    }
     pub(crate) fn repository_page(&self, after: &str) -> Result<CatalogRows, Error> {
         if !after.is_empty()
             && (nddev_device_sync_domain::ModuleId::new(after).is_err()
@@ -155,8 +203,25 @@ impl Journal {
         &self,
         selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
     ) -> Result<ObservationBaselines, Error> {
+        self.observation_baselines_inner(selected, None)
+    }
+    pub(crate) fn catalog_baselines(
+        &self,
+        selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        binding: &CatalogBinding,
+    ) -> Result<ObservationBaselines, Error> {
+        self.observation_baselines_inner(selected, Some(binding))
+    }
+    fn observation_baselines_inner(
+        &self,
+        selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        binding: Option<&CatalogBinding>,
+    ) -> Result<ObservationBaselines, Error> {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
+        if let Some(binding) = binding {
+            catalog_binding_current(&tx, binding)?;
+        }
         let selected_operation = selected_current(&tx, selected)?.body;
         let targets = {
             let mut query = tx.prepare("SELECT id,revision,next_base,pending_id,conflicted FROM local_entities WHERE kind='repository_state' AND id GLOB 'github:*' ORDER BY id LIMIT ?1").map_err(sql_failed)?;

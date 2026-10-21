@@ -648,6 +648,18 @@ impl VaultClient {
             expected.as_ref().and_then(|e| e.observation.as_ref()),
             resolution,
         ) {
+            (Some(source), resolution) if source.binding.is_some() => {
+                crate::storage::Command::EnqueueCatalogObservation {
+                    body: bytes,
+                    expected_revision: revision,
+                    expected_pending: pending,
+                    selected: source.selection.clone(),
+                    selected_operation: source.operation.clone(),
+                    binding: source.binding.clone().ok_or(Error::Invalid)?,
+                    writer,
+                    resolution: resolution.cloned(),
+                }
+            }
             (Some(source), Some(resolution)) => {
                 crate::storage::Command::EnqueueRepositoryResolution {
                     body: bytes,
