@@ -28,6 +28,7 @@ pub struct NativeReplica {
     stopped: AtomicBool,
     client_version: Option<String>,
     delivery: Mutex<Option<Arc<nddev_device_sync_accounts::telemetry::Delivery>>>,
+    catalog: CatalogSlot,
 }
 
 impl NativeReplica {
@@ -111,6 +112,7 @@ impl NativeReplica {
             stopped: AtomicBool::new(false),
             client_version,
             delivery: Mutex::default(),
+            catalog: Arc::default(),
         });
         owner.start(Duration::ZERO);
         *selected = Some(owner.clone());
@@ -135,6 +137,7 @@ impl NativeReplica {
                 policy_slot: self.policy.clone(),
                 schedule,
                 client_version: self.client_version.clone(),
+                catalog: self.catalog.clone(),
             },
             delay,
             true,
@@ -155,6 +158,24 @@ impl NativeReplica {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+    /// One typed GDS resource for this retained identity/Vault pair. The factory
+    /// is supplied by the assembly; Vault has no dependency on the GDS adapter.
+    pub fn catalog<T: CatalogCollector>(
+        &self,
+        create: impl FnOnce(Arc<IdentityClient>, Arc<VaultClient>) -> T,
+    ) -> Result<Arc<T>, Error> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(Error::Locked);
+        }
+        let mut slot = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(resource) = &*slot {
+            let resource: Arc<dyn std::any::Any + Send + Sync> = resource.clone();
+            return resource.downcast().map_err(|_| Error::Invalid);
+        }
+        let resource = Arc::new(create(self.identity.clone(), self.vault.clone()));
+        *slot = Some(resource.clone());
+        Ok(resource)
     }
     /// One process exporter follows the retained identity, independently of UI
     /// attachment disposal. The assembly supplies its existing SDK feeds once.
@@ -240,6 +261,14 @@ impl NativeReplica {
         }
     }
     async fn stop_task(&self) -> Result<(), Error> {
+        if let Some(catalog) = self
+            .catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            catalog.cancel();
+        }
         let task = self
             .task
             .lock()

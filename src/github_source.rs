@@ -193,6 +193,7 @@ impl VaultClient {
                 fence: fence.clone(),
                 cancellation: tokio_util::sync::CancellationToken::new(),
                 binding: None,
+                caller: None,
             })
         } else {
             None
@@ -247,6 +248,17 @@ mod tests {
         let outcome = async {
             let vault = VaultClient::new(identity.clone(), directory.clone()).await?;
             crate::client::catalog_acceptance::settle(&vault).await?;
+            // A follower cannot start another provider flight while the real
+            // native owner/batch is retained. Releasing it permits handoff.
+            let owner = vault.replica_owner().await?;
+            let lease = vault.catalog_lease().await?;
+            let follower = VaultClient::new(identity.clone(), directory.clone()).await?;
+            assert!(matches!(follower.catalog_lease().await, Err(Error::Busy)));
+            drop(lease);
+            drop(owner);
+            let handoff = follower.catalog_lease().await?;
+            drop(handoff);
+            drop(follower);
             assert!(vault.github_source().await?.selection.is_none());
             let original = vault
                 .save_record(
@@ -307,6 +319,22 @@ mod tests {
             assert!(committed.pending_id.is_none() && !committed.conflicted);
             assert_eq!(committed.operation_id.as_ref(), Some(&receipt.operation_id));
             assert!(vault.repository_observation(&read, &repository).await?.value.is_none());
+            vault.validate_repository_read(&configured).await?;
+            // A facade may borrow the retained owner's resources, never its
+            // authority. Cancelling that original facade still refuses use.
+            let caller = Arc::new(IdentityClient::new(&identity.origin()).map_err(identity_failure)?);
+            caller.refresh().await.map_err(identity_failure)?;
+            caller.prepare_device("Owned source facade".into()).await.map_err(identity_failure)?;
+            let mut delegated = vault.capture_configured_repository_observations(
+                &required,
+                &receipt.operation_id,
+                Arc::new(identity.local_use_fence().await.map_err(identity_failure)?),
+                tokio_util::sync::CancellationToken::new(),
+            ).await?;
+            let caller_fence = Arc::new(caller.local_use_fence().await.map_err(identity_failure)?);
+            vault.bind_repository_caller(&mut delegated, caller.clone(), caller_fence).await?;
+            caller.cancel();
+            assert!(matches!(vault.validate_repository_read(&delegated).await, Err(Error::Locked)));
             vault.validate_repository_read(&configured).await?;
             let disabled = vault.set_module_configuration("gds".into(), 1, None, Default::default()).await?;
             assert!(matches!(vault.validate_repository_read(&configured).await, Err(Error::SelectionChanged)));
