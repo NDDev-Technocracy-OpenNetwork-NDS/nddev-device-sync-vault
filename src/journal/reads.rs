@@ -34,17 +34,20 @@ pub(super) fn selected_current(
     selected.validate().map_err(|_| Error::Invalid)?;
     let record = entity(connection, "vault_record", selected.record_ref())?
         .ok_or(Error::SelectionChanged)?;
-    if record.conflicted
-        || record.revision != selected.revision()
-        || record.pending_id.as_deref() != selected.pending_id()
-    {
-        return Err(Error::SelectionChanged);
-    }
     let operation = crate::codec::versioned(&record.body)?;
     if operation.operation.entity_kind != nddev_device_sync_domain::sync::EntityKind::VaultRecord
         || operation.operation.entity_id != selected.record_ref()
     {
         return Err(Error::Invalid);
+    }
+    if record.conflicted
+        || !selected.matches_record(
+            &operation.operation,
+            record.revision,
+            record.pending_id.as_deref(),
+        )
+    {
+        return Err(Error::SelectionChanged);
     }
     Ok(record)
 }
@@ -156,7 +159,7 @@ impl Journal {
         let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
         let selected_operation = selected_current(&tx, selected)?.body;
         let targets = {
-            let mut query = tx.prepare("SELECT id,revision,next_base,pending_id,conflicted FROM local_entities WHERE kind='repository_state' ORDER BY id LIMIT ?1").map_err(sql_failed)?;
+            let mut query = tx.prepare("SELECT id,revision,next_base,pending_id,conflicted FROM local_entities WHERE kind='repository_state' AND id GLOB 'github:*' ORDER BY id LIMIT ?1").map_err(sql_failed)?;
             query
                 .query_map([(nddev_device_sync_application::repositories::catalog::observations::MAX_BASELINES + 1) as u32], |row| {
                     Ok(ObservationMetadata {

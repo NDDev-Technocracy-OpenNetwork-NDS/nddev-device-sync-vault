@@ -239,10 +239,10 @@ impl Journal {
         if count >= 1024 {
             return Err(Error::Busy);
         }
-        if selected.is_some() {
+        if selected.is_some() && operation.entity_id.starts_with("github:") {
             let observations: usize = tx
                 .query_row(
-                    "SELECT count(*) FROM v3_outbox WHERE kind='repository_state'",
+                    "SELECT count(*) FROM v3_outbox WHERE kind='repository_state' AND entity_id GLOB 'github:*'",
                     [],
                     |r| r.get(0),
                 )
