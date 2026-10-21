@@ -427,7 +427,10 @@ impl VaultClient {
                 // for device verification rather than reporting broken storage.
                 return Err(Error::Busy);
             }
-            self.identity.refresh_devices().await.map_err(dependency)?;
+            self.identity
+                .refresh_devices()
+                .await
+                .map_err(identity_failure)?;
             self.authorized()?;
         }
         Ok(())
