@@ -176,6 +176,18 @@ mod tests {
                 .await?;
             let selected =
                 CredentialSelection::new("owned-source".into(), 0, Some(original)).unwrap();
+            // A page captured before synchronization keeps the same encrypted
+            // credential after its receipt updates revision/pending metadata.
+            let read = vault
+                .capture_repository_observations(
+                    selected.clone(),
+                    Arc::new(identity.local_use_fence().await.map_err(identity_failure)?),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await?;
+            let repository = nddev_device_sync_domain::repositories::catalog::observations::ObservationKey::Repository(
+                nddev_device_sync_domain::repositories::catalog::RepositoryId::new(1).unwrap(),
+            );
             let receipt = vault
                 .set_github_source(Some(selected.clone()), 0, None)
                 .await?;
@@ -192,6 +204,7 @@ mod tests {
             assert_eq!(committed.revision, 1);
             assert!(committed.pending_id.is_none() && !committed.conflicted);
             assert_eq!(committed.operation_id.as_ref(), Some(&receipt.operation_id));
+            assert!(vault.repository_observation(&read, &repository).await?.value.is_none());
             assert_eq!(
                 vault.native_secret_at(&selected).await?.as_str(),
                 "SYNTHETIC_SOURCE_CANARY"
@@ -224,6 +237,10 @@ mod tests {
                     Zeroizing::new("SYNTHETIC_REPLACEMENT_CANARY".into()),
                 )
                 .await?;
+            assert!(matches!(
+                vault.repository_observation(&read, &repository).await,
+                Err(Error::SelectionChanged)
+            ));
             assert!(matches!(
                 vault.ensure_record_current(&selected).await,
                 Err(Error::SelectionChanged)

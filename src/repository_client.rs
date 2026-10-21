@@ -431,9 +431,13 @@ impl VaultClient {
             .entity("vault_record", read.source.selection.record_ref())
             .await?
             .ok_or(Error::SelectionChanged)?;
+        let operation = codec::versioned(&current.body)?;
         if current.conflicted
-            || current.revision != read.source.selection.revision()
-            || current.pending_id.as_deref() != read.source.selection.pending_id()
+            || !read.source.selection.matches_record(
+                &operation.operation,
+                current.revision,
+                current.pending_id.as_deref(),
+            )
             || current.body != read.source.operation
         {
             return Err(Error::SelectionChanged);
