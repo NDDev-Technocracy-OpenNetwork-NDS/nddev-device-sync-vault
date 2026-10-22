@@ -362,7 +362,8 @@ impl VaultClient {
     }
     /// Capture local target metadata before GitHub I/O, without holding a store
     /// lock across that I/O. The caller supplies its original identity fence.
-    pub async fn capture_repository_observations(
+    #[cfg(test)]
+    pub(super) async fn capture_repository_observations(
         &self,
         selection: CredentialSelection,
         fence: Arc<LocalUseFence>,
