@@ -1,70 +1,41 @@
-name: NDS vault checks
+name: NDS checks
+
 on:
   pull_request:
-    branches: [dev, main]
-  push:
-    branches: [dev, main]
+    branches: [main, dev]
   workflow_dispatch:
+
 permissions:
   contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-env:
-  CARGO_BUILD_JOBS: 4
+
 jobs:
-  native:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
-      - run: cargo fmt --check
-      - run: cargo test --locked --all-features
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-  dependencies:
+  quality:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.99.1 --profile minimal
-      - run: cargo install --locked --version 0.22.2 cargo-audit
-      - run: cargo install --locked --version 0.20.2 cargo-deny
-      - run: cargo audit --deny warnings
-      - run: cargo deny --locked check licenses sources
-  wasm:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version-file: package.json
-      - name: Strict browser I/O and generated adapter drift
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
+      - name: Install pinned quality tools
         run: |
-          bun install --frozen-lockfile --ignore-scripts
-          bun run check
-          bun run check:generated
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: '24.22.0'
-      - run: rustup toolchain install 1.99.1 --profile minimal --component clippy --target wasm32-unknown-unknown
-      - run: cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
-  quality:
-    if: always()
-    needs: [native, dependencies, wasm]
-    runs-on: ubuntu-24.04
-    steps:
-      - run: test '${{ needs.native.result }}' = success && test '${{ needs.dependencies.result }}' = success && test '${{ needs.wasm.result }}' = success
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo install --locked --version 0.20.2 cargo-deny
+      - name: Run the STD-0004 native Rust contract
+        id: native
+        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/ci@a77e385fcf3c1b000c38167ecac7b74bb7715b10 # std-0004-v0.3.1
+      - name: Require complete native results
+        if: ${{ !cancelled() }}
+        env:
+          STATUS: ${{ steps.native.outputs.status }}
+        run: test "$STATUS" = success
