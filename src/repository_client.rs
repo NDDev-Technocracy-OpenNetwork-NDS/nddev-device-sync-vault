@@ -17,12 +17,24 @@ pub(super) struct SourceGuard {
     pub(super) fence: Arc<LocalUseFence>,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
     pub(super) binding: Option<crate::journal::CatalogBinding>,
+    pub(super) caller: Option<CallerGuard>,
+}
+#[derive(Clone)]
+pub(super) struct CallerGuard {
+    identity: Arc<IdentityClient>,
+    fence: Arc<LocalUseFence>,
 }
 impl SourceGuard {
     pub(super) fn check(&self) -> Result<(), Error> {
         if self.cancellation.is_cancelled() {
             Err(Error::Cancelled)
         } else {
+            if let Some(caller) = &self.caller {
+                caller
+                    .identity
+                    .check_local_use_lifetime(&caller.fence)
+                    .map_err(identity_failure)?;
+            }
             Ok(())
         }
     }
@@ -350,7 +362,8 @@ impl VaultClient {
     }
     /// Capture local target metadata before GitHub I/O, without holding a store
     /// lock across that I/O. The caller supplies its original identity fence.
-    pub async fn capture_repository_observations(
+    #[cfg(test)]
+    pub(super) async fn capture_repository_observations(
         &self,
         selection: CredentialSelection,
         fence: Arc<LocalUseFence>,
@@ -431,6 +444,7 @@ impl VaultClient {
                 fence,
                 cancellation,
                 binding,
+                caller: None,
             },
             targets,
             writer_mode,
@@ -441,8 +455,35 @@ impl VaultClient {
         let _permit = self.admitted()?;
         self.validate_repository_read_inner(read).await
     }
+    /// The retained native owner supplies resources, while an interactive
+    /// facade keeps its own original authority. Binding only restricts a read;
+    /// it cannot transfer another endpoint/user/device's authorization.
+    pub async fn bind_repository_caller(
+        &self,
+        read: &mut RepositoryRead,
+        identity: Arc<IdentityClient>,
+        fence: Arc<LocalUseFence>,
+    ) -> Result<(), Error> {
+        if scope(&identity)? != self.scope || read.source.caller.is_some() {
+            return Err(Error::Invalid);
+        }
+        identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        read.source.check()?;
+        read.source.caller = Some(CallerGuard { identity, fence });
+        self.validate_repository_read(read).await
+    }
     async fn validate_repository_read_inner(&self, read: &RepositoryRead) -> Result<(), Error> {
         read.source.check()?;
+        if let Some(caller) = &read.source.caller {
+            caller
+                .identity
+                .validate_local_use(&caller.fence)
+                .await
+                .map_err(identity_failure)?;
+        }
         self.identity
             .validate_local_use(&read.source.fence)
             .await
@@ -480,6 +521,13 @@ impl VaultClient {
             }
         }
         read.source.check()?;
+        if let Some(caller) = &read.source.caller {
+            caller
+                .identity
+                .validate_local_use(&caller.fence)
+                .await
+                .map_err(identity_failure)?;
+        }
         let result = self
             .identity
             .validate_local_use(&read.source.fence)

@@ -9,6 +9,7 @@ use nddev_device_sync_accounts::{
     runtime::{self, Instant},
     view::ClientError,
 };
+use nddev_device_sync_application::repositories::catalog::collection::CatalogCollector;
 use nddev_device_sync_application::{
     lifecycle::{BatchOutcome, CapacityCheck, ReplicaSchedule},
     replica::CapacityProbeOutcome,
@@ -18,6 +19,8 @@ use std::{
     time::Duration,
 };
 use tracing::Instrument;
+
+pub type CatalogSlot = Arc<Mutex<Option<Arc<dyn CatalogCollector>>>>;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[path = "native_replication.rs"]
@@ -34,6 +37,7 @@ pub struct ReplicaContext {
     /// Continuous clients publish their device observation once. A bounded CLI
     /// read does not rewrite installation metadata.
     pub client_version: Option<String>,
+    pub catalog: CatalogSlot,
 }
 
 struct Activity {
@@ -57,6 +61,7 @@ impl ReplicaTask {
             policy_slot,
             schedule,
             client_version,
+            catalog,
         } = context;
         let (active, mut enabled) = tokio::sync::watch::channel(Activity {
             active,
@@ -95,6 +100,7 @@ impl ReplicaTask {
                 let mut inbox_empty = false;
                 let mut capacity_outcome = None;
                 let mut attempt_history = None;
+                let mut catalog_pending = false;
                 let lifetime = identity.local_use_lifetime();
                 let Some(vault) = weak.upgrade() else {
                     break;
@@ -201,7 +207,7 @@ impl ReplicaTask {
                         attempt_history = attempt.history;
                         let progress = attempt.result?;
                         inbox_at_head = Some(progress.inbox_at_head);
-                        let view = progress.view;
+                        let mut view = progress.view;
                         if !published
                             && !view.catching_up
                             && !schedule
@@ -219,6 +225,22 @@ impl ReplicaTask {
                             let view = attempt.result?;
                             published = true;
                             return Ok(view);
+                        }
+                        if !view.catching_up
+                            && !schedule
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .is_capacity_blocked()
+                        {
+                            let collector =
+                                catalog.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            if let Some(collector) = collector {
+                                let collected = collector.collect().await;
+                                catalog_pending = collected.continue_traversal;
+                                if collected.local_changes {
+                                    view = vault.refresh_local().await?;
+                                }
+                            }
                         }
                         Ok(view)
                     }),
@@ -272,6 +294,7 @@ impl ReplicaTask {
                         BatchOutcome::InboxHead
                     }
                     (true, Some(false)) if inbox_only => BatchOutcome::InboxMore,
+                    (true, _) if catalog_pending => BatchOutcome::CatchingUp,
                     _ => batch_outcome(&result),
                 };
                 let sample = if matches!(outcome, BatchOutcome::Retryable) {
