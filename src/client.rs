@@ -95,6 +95,13 @@ pub struct VaultClient {
     known_committed_seq: std::sync::atomic::AtomicU64,
     capacity_history: Mutex<Option<nddev_device_sync_domain::sync::history::HistoryVersion>>,
 }
+/// Resource ownership only. Provider authority still comes from the original
+/// Accounts fence and the configured encrypted repository read.
+pub struct CatalogLease {
+    _sync: OwnedSemaphorePermit,
+    #[cfg(not(target_arch = "wasm32"))]
+    _replica: Arc<crate::storage::ReplicaLease>,
+}
 fn dependency<E>(_: E) -> Error {
     Error::Unavailable
 }
@@ -253,6 +260,23 @@ impl VaultClient {
     pub async fn refresh_local(&self) -> Result<VaultView, Error> {
         let _permit = self.admitted()?;
         self.update_view().await
+    }
+    /// Use the same sync gate and actual owner/batch lock as reconciliation.
+    /// Native SQLite workers retain the batch lease after a caller is cancelled.
+    pub async fn catalog_lease(&self) -> Result<CatalogLease, Error> {
+        self.authorized()?;
+        let sync = self
+            .sync_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let replica = self.journal.replica_lock().await?;
+        Ok(CatalogLease {
+            _sync: sync,
+            #[cfg(not(target_arch = "wasm32"))]
+            _replica: replica,
+        })
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn replica_owner(&self) -> Result<Arc<std::fs::File>, Error> {

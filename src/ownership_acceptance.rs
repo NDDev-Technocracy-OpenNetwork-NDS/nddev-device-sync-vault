@@ -217,6 +217,7 @@ fn start_policy(identity: Arc<IdentityClient>, vault: &Arc<VaultClient>) -> (Rep
             policy_slot: policy.clone(),
             schedule,
             client_version: None,
+            catalog: Arc::default(),
         },
         Duration::ZERO,
         true,
