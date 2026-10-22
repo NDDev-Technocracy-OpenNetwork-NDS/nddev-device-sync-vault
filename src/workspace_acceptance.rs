@@ -159,6 +159,18 @@ async fn exercise(identity: Arc<IdentityClient>, directory: PathBuf) -> Result<(
     catalog_acceptance::settle(&vault).await?;
     let committed = vault.repository_connection(location.repository_id).await?;
     assert!(committed.pending_id.is_none() && committed.revision == 1 && !committed.conflicted);
+    // Acknowledgement during slow filesystem I/O changes metadata, not intent.
+    assert!(
+        vault
+            .save_repository_connection(
+                &read,
+                location.clone(),
+                pending.revision,
+                pending.pending_id
+            )
+            .await?
+            .is_none()
+    );
     // Another replica receives the same owner-wide entity. Per-device markers
     // are not serialized, so receiving it never grants local Git write access.
     let peer = VaultClient::new(identity.clone(), directory.join("peer")).await?;

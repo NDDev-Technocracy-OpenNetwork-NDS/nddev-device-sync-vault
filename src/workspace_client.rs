@@ -83,11 +83,7 @@ impl VaultClient {
             .map_err(|_| Error::Cancelled)?;
         let id = connection_entity_id(location.repository_id);
         let current = self.journal.entity("repository_state", &id).await?;
-        if current.as_ref().is_some_and(|value| value.conflicted)
-            || current.as_ref().map_or(0, |value| value.revision) != expected_revision
-            || current.as_ref().and_then(|value| value.pending_id.as_ref())
-                != expected_pending.as_ref()
-        {
+        if current.as_ref().is_some_and(|value| value.conflicted) {
             return Err(Error::Busy);
         }
         if let Some(current) = current {
@@ -103,6 +99,9 @@ impl VaultClient {
                 return Err(Error::Busy);
             }
             return Err(Error::Invalid);
+        }
+        if expected_revision != 0 || expected_pending.is_some() {
+            return Err(Error::Busy);
         }
         let snapshot = Snapshot {
             schema_version: 2,
