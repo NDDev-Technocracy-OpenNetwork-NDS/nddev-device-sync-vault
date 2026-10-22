@@ -168,12 +168,23 @@ impl NativeReplica {
         if self.stopping.load(Ordering::Acquire) {
             return Err(Error::Locked);
         }
+        self.identity
+            .check_local_use_lifetime(&self.authority)
+            .map_err(replica_auth_error)?;
         let mut slot = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(resource) = &*slot {
             let resource: Arc<dyn std::any::Any + Send + Sync> = resource.clone();
             return resource.downcast().map_err(|_| Error::Invalid);
         }
         let resource = Arc::new(create(self.identity.clone(), self.vault.clone()));
+        // Stop rotates the original owner authority before draining this slot.
+        // A factory racing that transition cannot publish a replacement grant.
+        self.identity
+            .check_local_use_lifetime(&self.authority)
+            .map_err(replica_auth_error)?;
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(Error::Locked);
+        }
         *slot = Some(resource.clone());
         Ok(resource)
     }
