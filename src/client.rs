@@ -1397,7 +1397,9 @@ impl VaultClient {
         let mut prepared = Vec::new();
         for snapshot in snapshots {
             let (kind, id) = match &snapshot.data {
-                State::Repository { .. } | State::GithubSource { .. } => {
+                State::Repository { .. }
+                | State::GithubSource { .. }
+                | State::RepositoryConnection { .. } => {
                     return Err(Error::Invalid);
                 }
                 State::Device { .. } => (EntityKind::DeviceState, self.scope.device.clone()),
@@ -1514,7 +1516,9 @@ impl VaultClient {
                 conflicted: entity.conflicted,
             };
             match snapshot.data {
-                State::Repository { .. } | State::GithubSource { .. } => {
+                State::Repository { .. }
+                | State::GithubSource { .. }
+                | State::RepositoryConnection { .. } => {
                     return Err(Error::Invalid);
                 }
                 State::Device {
@@ -2379,6 +2383,14 @@ mod github_source;
 mod module;
 pub use github_source::GithubSourceSetting;
 pub use module::{ModuleMutation, ModuleSetting};
+
+#[path = "workspace_client.rs"]
+mod workspace;
+pub use workspace::ConnectionSetting;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "workspace_acceptance.rs"]
+mod workspace_acceptance;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "ownership_acceptance.rs"]
