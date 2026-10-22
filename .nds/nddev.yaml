@@ -1,0 +1,55 @@
+# std-0001 repository manifest — schema: `nddev schema manifest`.
+apiVersion: nddev.ai/v1alpha3
+kind: Repository
+metadata:
+  id: nddev-device-sync-vault
+  locator: github:NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault
+  owner: rldyourmnd
+spec:
+  standard:
+    id: std-0001
+    version: 3.0.0
+  role: component
+  profiles:
+  - rust
+  - typescript
+  system:
+    id: nds
+    root: github:NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync
+  provides:
+  - name: vault
+    source: src/lib.rs
+    direction: code-first
+  consumes:
+  - contract: nddev-device-sync-core/domain
+    via: Cargo.toml
+  - contract: nddev-device-sync-core/application
+    via: Cargo.toml
+  - contract: nddev-device-sync-accounts/accounts
+    via: Cargo.toml
+  - contract: nddev-device-sync-observability/telemetry
+    via: Cargo.toml
+  variations:
+  - paths: [.gds]
+    purpose: config
+    reason: GDS-owned repository anchor and policy projections; std-0001 excludes .gds by its own boundary rule.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [module.yaml, tsconfig.base.json]
+    purpose: manifest
+    reason: NDS module descriptor and shared TypeScript project references owned by the product standards corpus.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [standarts.lock]
+    purpose: lock
+    reason: NDS contract lock pinning the standards corpus.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [scripts]
+    purpose: tool-config
+    reason: Native fleet-acceptance tooling owned by the repository.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [examples]
+    purpose: example
+    reason: Runnable consumer examples owned by the repository.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  adapters:
+  - claude
+  - cursor

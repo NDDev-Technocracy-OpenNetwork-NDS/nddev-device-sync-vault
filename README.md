@@ -250,3 +250,5 @@ bounded to 128 MiB per process and total raw/compressed artifacts to 2 GiB.
 All producer records are retained as bounded gzip artifacts; sequence gaps,
 SDK loss and sink failures fail the check. This tests NDS synchronization with
 generated inputs, not GitHub-provider discovery or 32 different hardware devices.
+
+Release journals live in [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault/releases).
