@@ -43,7 +43,7 @@ impl SourceGuard {
 /// Opaque pre-provider read, owned by one caller lifetime. It contains no key or
 /// plaintext credential and cannot be serialized into a new authorization.
 pub struct RepositoryRead {
-    source: SourceGuard,
+    pub(super) source: SourceGuard,
     targets: BTreeMap<String, TargetVersion>,
     writer_mode: Option<replica::WriterMode>,
 }
@@ -475,7 +475,10 @@ impl VaultClient {
         read.source.caller = Some(CallerGuard { identity, fence });
         self.validate_repository_read(read).await
     }
-    async fn validate_repository_read_inner(&self, read: &RepositoryRead) -> Result<(), Error> {
+    pub(super) async fn validate_repository_read_inner(
+        &self,
+        read: &RepositoryRead,
+    ) -> Result<(), Error> {
         read.source.check()?;
         if let Some(caller) = &read.source.caller {
             caller

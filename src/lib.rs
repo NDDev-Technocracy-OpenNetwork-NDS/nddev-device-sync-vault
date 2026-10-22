@@ -4,9 +4,10 @@ mod codec;
 mod key_discovery;
 pub mod replication;
 pub use client::{
-    CatalogLease, CheckpointStage, GithubSourceSetting, InboxProgress, ModuleMutation,
-    ModuleSetting, RepositoryCatalogCursor, RepositoryCatalogPage, RepositoryPublication,
-    RepositoryRead, RepositoryResolution, RetainedRepositoryObservation, SyncAttempt, VaultClient,
+    CatalogLease, CheckpointStage, ConnectionSetting, GithubSourceSetting, InboxProgress,
+    ModuleMutation, ModuleSetting, RepositoryCatalogCursor, RepositoryCatalogPage,
+    RepositoryPublication, RepositoryRead, RepositoryResolution, RetainedRepositoryObservation,
+    SyncAttempt, VaultClient,
 };
 use nddev_device_sync_accounts::sync3_wire;
 pub mod view;

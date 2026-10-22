@@ -82,7 +82,7 @@ impl VaultClient {
             .await
     }
 
-    fn decrypt_state_snapshot(
+    pub(super) fn decrypt_state_snapshot(
         &self,
         key: &VaultKey,
         kind: EntityKind,
