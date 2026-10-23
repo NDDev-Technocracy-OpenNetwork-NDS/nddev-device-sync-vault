@@ -119,6 +119,23 @@ impl Journal {
             Ok(CatalogRows { entries, cursor, local_revision })
         })
     }
+    pub(crate) fn connection_page(&self, after: &str) -> Result<CatalogRows, Error> {
+        if !after.is_empty()
+            && (after.len() > 64
+                || !after.starts_with("nds:connection:")
+                || nddev_device_sync_domain::ModuleId::new(after).is_err())
+        {
+            return Err(Error::Invalid);
+        }
+        self.read(|connection| {
+            let (cursor, local_revision) = catalog_revision(connection)?;
+            let mut query = connection.prepare(
+                "SELECT id,revision,body,server_seq,conflicted,pending_id,next_base FROM local_entities WHERE kind='repository_state' AND id GLOB 'nds:connection:*' AND id>?1 ORDER BY id LIMIT 51",
+            ).map_err(sql_failed)?;
+            let entries = query.query_map([after], read_catalog_entry).map_err(sql_failed)?.collect::<Result<Vec<_>, _>>().map_err(sql_failed)?;
+            Ok(CatalogRows { entries, cursor, local_revision })
+        })
+    }
     /// Resolve this page's owner headers under the same observed local revision.
     /// No transaction remains open while the main Rust owner decrypts the page.
     pub(crate) fn repository_owners(

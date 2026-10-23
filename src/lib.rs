@@ -4,8 +4,8 @@ mod codec;
 mod key_discovery;
 pub mod replication;
 pub use client::{
-    CatalogLease, CheckpointStage, ConnectionSetting, GithubSourceSetting, InboxProgress,
-    ModuleMutation, ModuleSetting, RepositoryCatalogCursor, RepositoryCatalogPage,
+    CatalogLease, CheckpointStage, ConnectionPage, ConnectionSetting, GithubSourceSetting,
+    InboxProgress, ModuleMutation, ModuleSetting, RepositoryCatalogCursor, RepositoryCatalogPage,
     RepositoryPublication, RepositoryRead, RepositoryResolution, RetainedRepositoryObservation,
     SyncAttempt, VaultClient,
 };

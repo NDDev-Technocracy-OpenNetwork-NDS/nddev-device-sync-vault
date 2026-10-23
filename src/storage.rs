@@ -125,6 +125,9 @@ pub(crate) enum Command {
     RepositoryPage {
         after: String,
     },
+    ConnectionPage {
+        after: String,
+    },
     RepositoryOwners {
         ids: Vec<String>,
         expected: u64,
@@ -242,6 +245,7 @@ impl Command {
             Self::ObservationTarget { .. } => "vault.storage.observation_target",
             Self::ObservationResolution { .. } => "vault.storage.observation_resolution",
             Self::RepositoryPage { .. } => "vault.storage.repository_page",
+            Self::ConnectionPage { .. } => "vault.storage.connection_page",
             Self::RepositoryOwners { .. } => "vault.storage.repository_owners",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
             Self::CatalogContext { .. } => "vault.storage.catalog_context",
@@ -375,6 +379,7 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
             &selected_operation,
         )?),
         Command::RepositoryPage { after } => Reply::CatalogRows(journal.repository_page(&after)?),
+        Command::ConnectionPage { after } => Reply::CatalogRows(journal.connection_page(&after)?),
         Command::RepositoryOwners { ids, expected } => {
             Reply::CatalogRows(journal.repository_owners(&ids, expected)?)
         }

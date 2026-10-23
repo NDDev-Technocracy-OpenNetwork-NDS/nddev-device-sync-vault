@@ -246,6 +246,58 @@ async fn actual_retained_runtime_survives_facade_cancellation_and_reuses_policy(
         .unwrap();
     let before = current_updates(retained.updates().unwrap(), 0).await;
     let policy = retained.schedule();
+    // A real Git process waits for stdin under the SAME elected collector.
+    // Replication must finish the canary below while this work is pending.
+    struct SlowGit {
+        started: tokio_util::sync::CancellationToken,
+        cancelled: tokio_util::sync::CancellationToken,
+        drained: tokio_util::sync::CancellationToken,
+    }
+    impl nddev_device_sync_application::repositories::catalog::collection::CatalogCollector
+        for SlowGit
+    {
+        fn collect(
+            self: Arc<Self>,
+        ) -> nddev_device_sync_application::repositories::catalog::collection::Collection {
+            Box::pin(async move {
+                if self.cancelled.is_cancelled() {
+                    return Default::default();
+                }
+                let mut git = tokio::process::Command::new("git")
+                    .args(["hash-object", "--stdin"])
+                    .env_clear()
+                    .env("PATH", std::env::var_os("PATH").unwrap())
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                self.started.cancel();
+                tokio::select! {
+                    _ = self.cancelled.cancelled() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => panic!("Vault did not advance while Git was pending"),
+                }
+                git.kill().await.unwrap();
+                self.drained.cancel();
+                Default::default()
+            })
+        }
+        fn cancel(&self) {
+            self.cancelled.cancel();
+        }
+    }
+    let git = retained
+        .catalog(|_, _| SlowGit {
+            started: Default::default(),
+            cancelled: Default::default(),
+            drained: Default::default(),
+        })
+        .unwrap();
+    retained.wake();
+    tokio::time::timeout(Duration::from_secs(10), git.started.cancelled())
+        .await
+        .unwrap();
     let facade = VaultClient::new(identity.clone(), directory.0.clone())
         .await
         .unwrap();
@@ -276,6 +328,10 @@ async fn actual_retained_runtime_survives_facade_cancellation_and_reuses_policy(
     retained.wake();
     let caught_up = current_updates(retained.updates().unwrap(), before.cursor + 1).await;
     assert_eq!(caught_up.pending, 0);
+    assert!(
+        !git.drained.is_cancelled(),
+        "Vault must advance before the slow Git ends"
+    );
     // Reopening attaches to the same independent task and policy identity.
     let reopened = Arc::new(IdentityClient::new(&endpoint).unwrap());
     assert!(reopened.refresh().await.unwrap().authenticated);
@@ -300,6 +356,10 @@ async fn actual_retained_runtime_survives_facade_cancellation_and_reuses_policy(
         "SYNTHETIC_RETAINED_RUNTIME_CANARY"
     );
     let retried = retained.synchronize().await.unwrap();
+    assert!(
+        git.drained.is_cancelled(),
+        "manual restart must drain the old Git owner"
+    );
     assert!(retried.pending == 0 && !retried.catching_up);
     assert!(retained.is_running());
     let mut previous = retained.updates().unwrap();

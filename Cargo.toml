@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.11"
+version = "0.0.1-alpha.12"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -37,7 +37,7 @@ libc = "0.2"
 [dev-dependencies]
 time = {version="0.3",features=["parsing"]}
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "process"] }
 
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
