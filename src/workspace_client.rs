@@ -15,7 +15,64 @@ pub struct ConnectionSetting {
     pub conflicted: bool,
 }
 
+pub struct ConnectionPage {
+    pub items: Vec<ConnectionSetting>,
+    pub next_after: String,
+    pub has_more: bool,
+}
+
 impl VaultClient {
+    /// Bounded local intent enumeration, including unacknowledged originals.
+    /// This read does not enqueue operations or grant Git authority.
+    pub async fn repository_connection_page(&self, after: String) -> Result<ConnectionPage, Error> {
+        let _permit = self.admitted()?;
+        let fence = self
+            .identity
+            .local_use_fence()
+            .await
+            .map_err(identity_failure)?;
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let crate::storage::Reply::CatalogRows(mut rows) = self
+            .journal
+            .call(crate::storage::Command::ConnectionPage { after })
+            .await?
+        else {
+            return Err(Error::Invalid);
+        };
+        let has_more = rows.entries.len() > 50;
+        rows.entries.truncate(50);
+        let next_after = rows
+            .entries
+            .last()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_default();
+        let mut items = Vec::with_capacity(rows.entries.len());
+        for (id, entity) in rows.entries {
+            let snapshot =
+                self.decrypt_state_snapshot(&key, EntityKind::RepositoryState, &id, &entity.body)?;
+            let State::RepositoryConnection { location } = snapshot.data else {
+                return Err(Error::Invalid);
+            };
+            if connection_entity_id(location.repository_id) != id {
+                return Err(Error::Invalid);
+            }
+            items.push(ConnectionSetting {
+                location: Some(location),
+                revision: entity.revision,
+                pending_id: entity.pending_id,
+                conflicted: entity.conflicted,
+            });
+        }
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        Ok(ConnectionPage {
+            items,
+            next_after,
+            has_more,
+        })
+    }
     /// Rust-only scope metadata, not a grant. Every use still needs its original
     /// Accounts/source/credential/device-consent fence.
     pub fn workspace_principal(&self) -> WorkspacePrincipal {

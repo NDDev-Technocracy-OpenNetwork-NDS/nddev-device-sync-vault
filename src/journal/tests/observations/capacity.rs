@@ -159,3 +159,113 @@ fn saved_1024_repository_catalog_preserves_committed_and_pending_rows_after_rest
         }
     }
 }
+
+#[test]
+fn encrypted_connection_pages_cover_1024_intents_for_32_readers_without_rewriting_originals() {
+    use nddev_device_sync_domain::repositories::workspace::{
+        CheckoutLocation, connection_entity_id,
+    };
+    let (owned, journal, key, selected, before) = setup();
+    let writer = guard(&key, &before);
+    let mut expected = BTreeMap::new();
+    for number in 1..=1024 {
+        let location = CheckoutLocation::new(
+            RepositoryId::new(number).unwrap(),
+            GithubAccountId::new(1).unwrap(),
+            "fixture-owner".into(),
+            format!("repository-{number}"),
+        )
+        .unwrap();
+        let id = connection_entity_id(location.repository_id);
+        let mut operation =
+            crate::codec::versioned(&observed(&key, &selected, &format!("connection-{number}")))
+                .unwrap();
+        operation.operation.entity_id = id.clone();
+        let snapshot = Snapshot {
+            schema_version: 2,
+            observed_at_ms: 100,
+            data: State::RepositoryConnection { location },
+        };
+        snapshot
+            .validate(
+                &operation.operation.device,
+                EntityKind::RepositoryState,
+                &id,
+            )
+            .unwrap();
+        operation.operation.payload = key
+            .encrypt_versioned(
+                &scope(),
+                &operation,
+                &serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+        let body = crate::codec::versioned_body(&operation).unwrap();
+        journal
+            .enqueue_writer(body.clone(), None, 0, None, &writer)
+            .unwrap();
+        expected.insert(id, body.clone());
+        if number <= 992 {
+            let row = journal
+                .pending()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == operation.operation.id)
+                .unwrap();
+            let receipt = serde_json::to_vec(&wire::Sync::Applied(wire::SyncApplied {
+                operation_id: row.id,
+                outcome: wire::SyncAppliedOutcome::Applied,
+                revision: 1,
+                server_seq: (42 + number).try_into().unwrap(),
+            }))
+            .unwrap();
+            journal
+                .acknowledge_original(&body, &receipt, 201, 0)
+                .unwrap();
+        }
+    }
+    let originals = journal
+        .pending()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.id, row.body))
+        .collect::<BTreeMap<_, _>>();
+    drop(journal);
+    let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
+    for _reader in 0..32 {
+        let mut after = String::new();
+        let mut seen = BTreeSet::new();
+        loop {
+            let mut page = reopened.connection_page(&after).unwrap();
+            assert!(page.entries.len() <= 51);
+            let more = page.entries.len() > 50;
+            page.entries.truncate(50);
+            for (id, entity) in &page.entries {
+                assert!(seen.insert(id.clone()));
+                assert_eq!(entity.body, expected[id]);
+                let operation = crate::codec::versioned(&entity.body).unwrap();
+                let plain = key.decrypt_versioned(&scope(), &operation).unwrap();
+                let snapshot: Snapshot = serde_json::from_slice(&plain).unwrap();
+                assert!(matches!(snapshot.data, State::RepositoryConnection { .. }));
+            }
+            if !more {
+                break;
+            }
+            after = page.entries.last().unwrap().0.clone();
+        }
+        assert_eq!(seen.len(), 1024);
+    }
+    assert_eq!(
+        reopened
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.body))
+            .collect::<BTreeMap<_, _>>(),
+        originals
+    );
+    assert!(matches!(
+        reopened.connection_page("github:repo:1"),
+        Err(Error::Invalid)
+    ));
+}
