@@ -16,6 +16,8 @@ spec:
   system:
     id: nds
     root: github:NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync
+  portfolios:
+  - portfolio:nddev-opennetwork
   provides:
   - name: vault
     source: src/lib.rs
