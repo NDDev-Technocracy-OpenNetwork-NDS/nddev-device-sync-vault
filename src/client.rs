@@ -2386,7 +2386,7 @@ pub use module::{ModuleMutation, ModuleSetting};
 
 #[path = "workspace_client.rs"]
 mod workspace;
-pub use workspace::ConnectionSetting;
+pub use workspace::{ConnectionPage, ConnectionSetting};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "workspace_acceptance.rs"]
