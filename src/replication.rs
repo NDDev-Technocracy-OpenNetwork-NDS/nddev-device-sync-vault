@@ -57,6 +57,8 @@ pub struct ReplicaTask {
     owner: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(not(target_arch = "wasm32"))]
     collection: Arc<Mutex<collection::CollectionSlot>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    runtime: tokio::runtime::Handle,
 }
 impl ReplicaTask {
     pub fn spawn(context: ReplicaContext, initial_delay: Duration, active: bool) -> Self {
@@ -354,6 +356,8 @@ impl ReplicaTask {
             owner,
             #[cfg(not(target_arch = "wasm32"))]
             collection,
+            #[cfg(not(target_arch = "wasm32"))]
+            runtime: tokio::runtime::Handle::current(),
         }
     }
     pub fn set_active(&self, active: bool) {
@@ -396,6 +400,9 @@ impl ReplicaTask {
         }
         #[cfg(not(target_arch = "wasm32"))]
         return task.map(|task| {
+            // Synchronous FFI disposal may arrive on a UI thread without an
+            // entered Tokio runtime. Drain on the runtime that owns this task.
+            let _entered = self.runtime.enter();
             runtime::spawn(async move {
                 task.join().await;
                 if let Some(collection) = collection {
@@ -587,6 +594,47 @@ mod execution_tests {
         net::{TcpListener, TcpStream},
         sync::watch,
     };
+
+    #[test]
+    fn cancellation_from_a_foreign_thread_drains_on_the_original_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let replica = {
+            let _entered = runtime.enter();
+            let schedule = Arc::new(Mutex::new(ReplicaSchedule::default()));
+            ReplicaTask::spawn(
+                ReplicaContext {
+                    identity: Arc::new(IdentityClient::new("https://nds.example.invalid").unwrap()),
+                    vault: Weak::new(),
+                    publication: Arc::default(),
+                    policy_slot: Arc::new(Mutex::new(schedule.clone())),
+                    schedule,
+                    client_version: None,
+                    catalog: Arc::default(),
+                },
+                Duration::ZERO,
+                false,
+            )
+        };
+        let joined = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let mut replica = replica;
+            let joined = replica.cancel().unwrap();
+            assert!(!replica.is_running());
+            assert!(replica.cancel().is_none());
+            joined
+        })
+        .join()
+        .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), joined.join())
+                .await
+                .unwrap();
+        });
+    }
 
     #[tokio::test]
     async fn wake_keeps_the_same_actual_tcp_read_alive() {

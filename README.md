@@ -20,6 +20,10 @@ cancellation. The separate key-provisioning lock remains independent. Admission
 is per batch; retaining a background owner across GUI/CLI attachments is an
 assembly responsibility.
 
+Synchronous native cancellation may arrive from a UI or FFI thread outside
+Tokio. `ReplicaTask` drains cancelled work on its original runtime, retaining
+the existing collection and lease completion boundary.
+
 The native `ReplicaTask` retains a separate owner lease between batches. A
 second task follows that owner using one authenticated history observation and
 atomic journal snapshots under its original protected authorization fence. It
