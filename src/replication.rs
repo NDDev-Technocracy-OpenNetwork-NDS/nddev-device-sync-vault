@@ -22,6 +22,10 @@ use tracing::Instrument;
 
 pub type CatalogSlot = Arc<Mutex<Option<Arc<dyn CatalogCollector>>>>;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "catalog_task.rs"]
+mod collection;
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[path = "native_replication.rs"]
 pub mod native;
@@ -51,6 +55,8 @@ pub struct ReplicaTask {
     updates: tokio::sync::watch::Receiver<Option<Result<VaultView, VaultError>>>,
     #[cfg(not(target_arch = "wasm32"))]
     owner: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(not(target_arch = "wasm32"))]
+    collection: Arc<Mutex<collection::CollectionSlot>>,
 }
 impl ReplicaTask {
     pub fn spawn(context: ReplicaContext, initial_delay: Duration, active: bool) -> Self {
@@ -72,6 +78,10 @@ impl ReplicaTask {
         let owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(not(target_arch = "wasm32"))]
         let acquired = owner.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        let collection = Arc::new(Mutex::new(collection::CollectionSlot::default()));
+        #[cfg(not(target_arch = "wasm32"))]
+        let collecting = collection.clone();
         let task = runtime::spawn(async move {
             let mut schedule = schedule;
             let mut delay = initial_delay;
@@ -235,7 +245,16 @@ impl ReplicaTask {
                             let collector =
                                 catalog.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             if let Some(collector) = collector {
+                                #[cfg(target_arch = "wasm32")]
                                 let collected = collector.collect().await;
+                                #[cfg(not(target_arch = "wasm32"))]
+                                let collected = collecting
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .advance(
+                                        collector,
+                                        ownership.as_ref().ok_or(VaultError::Invalid)?.clone(),
+                                    );
                                 catalog_pending = collected.continue_traversal;
                                 if collected.local_changes {
                                     view = vault.refresh_local().await?;
@@ -318,6 +337,14 @@ impl ReplicaTask {
                 };
                 delay = next;
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Keep the handle available to a concurrent explicit stop.
+                collecting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cancel();
+            }
         });
         Self {
             active,
@@ -325,9 +352,18 @@ impl ReplicaTask {
             updates,
             #[cfg(not(target_arch = "wasm32"))]
             owner,
+            #[cfg(not(target_arch = "wasm32"))]
+            collection,
         }
     }
     pub fn set_active(&self, active: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !active {
+            self.collection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .interrupt();
+        }
         set_activity(&self.active, active);
     }
     pub fn is_active(&self) -> bool {
@@ -349,9 +385,25 @@ impl ReplicaTask {
     /// Abort now and retain the future for the caller's existing bounded join.
     pub fn cancel(&mut self) -> Option<runtime::Task> {
         let task = self.task.take();
+        #[cfg(not(target_arch = "wasm32"))]
+        let collection = self
+            .collection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stop();
         if let Some(task) = &task {
             task.abort();
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        return task.map(|task| {
+            runtime::spawn(async move {
+                task.join().await;
+                if let Some(collection) = collection {
+                    collection.join().await;
+                }
+            })
+        });
+        #[cfg(target_arch = "wasm32")]
         task
     }
 }
@@ -368,6 +420,12 @@ pub fn project_policy(view: &mut VaultView, schedule: &ReplicaSchedule) {
 }
 impl Drop for ReplicaTask {
     fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self
+            .collection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stop();
         if let Some(task) = &self.task {
             task.abort();
         }
