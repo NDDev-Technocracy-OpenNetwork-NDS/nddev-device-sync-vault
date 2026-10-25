@@ -7,6 +7,7 @@ use nddev_device_sync_application::repositories::catalog::collection::Collection
 pub(super) struct CollectionSlot {
     stopped: bool,
     work: Option<CollectionTask>,
+    ready: Arc<tokio::sync::Notify>,
 }
 struct CollectionTask {
     collector: Arc<dyn CatalogCollector>,
@@ -14,37 +15,65 @@ struct CollectionTask {
     result: tokio::sync::oneshot::Receiver<CollectionProgress>,
 }
 impl CollectionSlot {
+    pub(super) fn notification(&self) -> Arc<tokio::sync::Notify> {
+        self.ready.clone()
+    }
+    fn completed(&mut self) -> Option<CollectionProgress> {
+        let work = self.work.as_mut()?;
+        match work.result.try_recv() {
+            Ok(progress) => {
+                self.work.take();
+                Some(progress)
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.work.take();
+                Some(CollectionProgress::default())
+            }
+        }
+    }
+    /// Continue a completed traversal without changing the Vault batch timer.
+    /// A finished round waits for the next ordinary replica tick.
+    pub(super) fn continue_ready(
+        &mut self,
+        collector: Arc<dyn CatalogCollector>,
+        owner: Arc<std::fs::File>,
+    ) -> CollectionProgress {
+        let Some(progress) = self.completed() else {
+            return CollectionProgress::default();
+        };
+        if progress.continue_traversal {
+            self.start(collector, owner);
+        }
+        progress
+    }
     pub(super) fn advance(
         &mut self,
         collector: Arc<dyn CatalogCollector>,
         owner: Arc<std::fs::File>,
     ) -> CollectionProgress {
-        if self.stopped
-            || self
-                .work
-                .as_ref()
-                .is_some_and(|work| !work.task.is_finished())
-        {
-            return CollectionProgress::default();
+        let progress = self.completed().unwrap_or_default();
+        self.start(collector, owner);
+        progress
+    }
+    fn start(&mut self, collector: Arc<dyn CatalogCollector>, owner: Arc<std::fs::File>) {
+        if self.stopped || self.work.is_some() {
+            return;
         }
-        let progress = self
-            .work
-            .take()
-            .and_then(|mut work| work.result.try_recv().ok())
-            .unwrap_or_default();
         let collection = collector.clone().collect();
         let (send, result) = tokio::sync::oneshot::channel();
+        let ready = self.ready.clone();
         let task = runtime::spawn(async move {
             let _owner = owner;
             let progress = collection.await;
             let _ = send.send(progress);
+            ready.notify_one();
         });
         self.work = Some(CollectionTask {
             collector,
             task,
             result,
         });
-        progress
     }
     pub(super) fn cancel(&mut self) {
         self.stopped = true;
@@ -74,6 +103,65 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
     };
+    struct FiniteCollection(tokio::sync::Mutex<TcpStream>);
+    impl CatalogCollector for FiniteCollection {
+        fn collect(self: Arc<Self>) -> Collection {
+            Box::pin(async move {
+                let mut byte = [0];
+                self.0.lock().await.read_exact(&mut byte).await.unwrap();
+                CollectionProgress {
+                    local_changes: false,
+                    continue_traversal: byte[0] != b'!',
+                }
+            })
+        }
+        fn cancel(&self) {}
+    }
+    #[tokio::test]
+    async fn completed_io_continues_without_replica_ticks_and_a_finished_round_stays_idle() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let directory =
+                std::env::temp_dir().join(format!("nds-collection-wake-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let journal = crate::journal::Journal::open(directory.join("vault.sqlite")).unwrap();
+            let owner = Arc::new(journal.owner_lock().unwrap());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let collector = Arc::new(FiniteCollection(tokio::sync::Mutex::new(stream)));
+            let mut slot = CollectionSlot::default();
+            let ready = slot.notification();
+            slot.advance(collector.clone(), owner.clone());
+            for byte in *b"ab!" {
+                peer.write_all(&[byte]).await.unwrap();
+                ready.notified().await;
+                let progress = slot.continue_ready(collector.clone(), owner.clone());
+                assert_eq!(progress.continue_traversal, byte != b'!');
+                assert!(matches!(journal.owner_lock(), Err(Error::Busy)));
+            }
+            assert!(slot.work.is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), ready.notified())
+                    .await
+                    .is_err()
+            );
+            assert!(slot.stop().is_none());
+            // A late completion may not re-admit work after cancellation.
+            assert!(
+                !slot
+                    .continue_ready(collector, owner.clone())
+                    .continue_traversal
+            );
+            assert!(slot.work.is_none());
+            drop(owner);
+            drop(journal.owner_lock().unwrap());
+            std::fs::remove_dir_all(directory).unwrap();
+        })
+        .await
+        .unwrap();
+    }
     struct SlowCollection {
         stream: tokio::sync::Mutex<TcpStream>,
         cancelled: tokio_util::sync::CancellationToken,

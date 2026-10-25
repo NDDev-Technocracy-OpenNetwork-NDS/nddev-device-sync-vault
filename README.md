@@ -24,6 +24,12 @@ Synchronous native cancellation may arrive from a UI or FFI thread outside
 Tokio. `ReplicaTask` drains cancelled work on its original runtime, retaining
 the existing collection and lease completion boundary.
 
+Native collection completion wakes that same elected task. An unfinished
+traversal continues without waiting for the next Vault batch; a finished round
+stays idle until the ordinary tick. Its pinned batch timer keeps authorization
+maintenance and replication progressing during a busy Git traversal. New durable
+catalog observations wake the existing upload path.
+
 The native `ReplicaTask` retains a separate owner lease between batches. A
 second task follows that owner using one authenticated history observation and
 atomic journal snapshots under its original protected authorization fence. It
