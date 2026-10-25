@@ -84,17 +84,24 @@ impl ReplicaTask {
         let collection = Arc::new(Mutex::new(collection::CollectionSlot::default()));
         #[cfg(not(target_arch = "wasm32"))]
         let collecting = collection.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        let ready = collection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .notification();
         let task = runtime::spawn(async move {
             let mut schedule = schedule;
             let mut delay = initial_delay;
             let mut published = client_version.is_none();
             #[cfg(not(target_arch = "wasm32"))]
-            let mut ownership = None;
+            let mut ownership: Option<Arc<std::fs::File>> = None;
             #[cfg(not(target_arch = "wasm32"))]
             let mut observation: Option<crate::client::ReplicaObservation> = None;
             #[cfg(target_arch = "wasm32")]
             let mut restored_schedule = false;
-            loop {
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut collection_allowed = false;
+            'batches: loop {
                 if !enabled.borrow().active {
                     if enabled.changed().await.is_err() {
                         break;
@@ -102,9 +109,42 @@ impl ReplicaTask {
                     delay = Duration::ZERO;
                     continue;
                 }
-                tokio::select! {
-                    changed = enabled.changed() => { if changed.is_err() { break; } delay = Duration::ZERO; continue; }
-                    _ = runtime::sleep(delay) => {}
+                // Keep the batch timer pinned: Git completion must neither
+                // wait for the next tick nor postpone authorization/Vault I/O.
+                let timer = runtime::sleep(delay);
+                tokio::pin!(timer);
+                loop {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let completed = ready.notified();
+                    #[cfg(target_arch = "wasm32")]
+                    let completed = std::future::pending::<()>();
+                    tokio::select! {
+                        changed = enabled.changed() => {
+                            if changed.is_err() { break 'batches; }
+                            delay = Duration::ZERO;
+                            continue 'batches;
+                        }
+                        _ = &mut timer => break,
+                        _ = completed => {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if collection_allowed && enabled.borrow().active
+                                && let Some(owner) = ownership.as_ref()
+                                && let Some(collector) = catalog.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                            {
+                                let collected = collecting.lock().unwrap_or_else(|e| e.into_inner())
+                                    .continue_ready(collector, owner.clone());
+                                if collected.local_changes {
+                                    // Durable catalog changes use the existing
+                                    // upload path; the collector never uploads.
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    collection_allowed = false;
                 }
                 let mut capacity_check = None;
                 let mut inbox_only = false;
@@ -244,6 +284,10 @@ impl ReplicaTask {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .is_capacity_blocked()
                         {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                collection_allowed = true;
+                            }
                             let collector =
                                 catalog.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             if let Some(collector) = collector {
