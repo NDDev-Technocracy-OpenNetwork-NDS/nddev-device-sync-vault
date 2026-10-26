@@ -534,7 +534,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1576,7 +1576,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-accounts"
 version = "0.0.1-alpha.24"
-source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts?rev=ad2dbd86f74cc321d2016d25a30ee585e25b88ac#ad2dbd86f74cc321d2016d25a30ee585e25b88ac"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts?rev=ae1af64c79c311fb0125e22f1f15966bf2ed218b#ae1af64c79c311fb0125e22f1f15966bf2ed218b"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
