@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use std::fs::{self, File, OpenOptions};
 use std::{path::PathBuf, time::Duration};
 
-const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 fn check_version(connection: &Connection) -> Result<(), Error> {
     let version: u32 = connection
