@@ -17,3 +17,9 @@ pub mod browser;
 pub mod crypto;
 mod journal;
 mod storage;
+
+/// Journal format required by this implementation after its owned migrations.
+/// This is neither a database inspection nor permission to change stored data.
+pub const fn journal_schema_version() -> u32 {
+    journal::SCHEMA_VERSION
+}
