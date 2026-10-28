@@ -2149,8 +2149,16 @@ mod tests {
             let partial = fresh.refresh().await?;
             assert!(partial.catching_up && partial.cursor > 0 && partial.cursor < 36);
             assert_eq!(partial.last_sync_at, 0);
-            let complete = fresh.synchronize().await?;
-            assert!(!complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0);
+            // Each call retains the production batch/byte bound. Finish in a
+            // finite number of batches rather than assuming a fixed page count.
+            let mut complete = partial;
+            for _ in 0..16 {
+                if !complete.catching_up { break; }
+                complete = fresh.synchronize().await?;
+            }
+            assert!(!complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0,
+                "bounded catch-up: cursor={}, pending={}, catching_up={}, fresh={}",
+                complete.cursor, complete.pending, complete.catching_up, complete.last_sync_at > 0);
             assert_eq!(fresh.records(String::new()).await?.items.len(), 34);
             phase = "encrypted clipboard synchronization";
             let clipboard_text="Actual encrypted shared clipboard: проверка";
