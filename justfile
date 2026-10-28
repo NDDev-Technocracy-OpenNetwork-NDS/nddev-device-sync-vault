@@ -7,8 +7,13 @@ check: browser-check
     cargo audit --deny warnings
     cargo deny --locked check licenses sources
 
+# The large debug acceptance future needs a bounded test-runner thread stack.
+# This does not change application/runtime thread stacks or process limits.
 native-acceptance:
-    cargo test --locked --features development-http --lib actual_native_vault_outbox_backend_and_process_recreation -- --ignored
+    RUST_MIN_STACK=8388608 cargo test --locked --features development-http --lib actual_native_vault_outbox_backend_and_process_recreation -- --ignored
+
+legacy-schema-one-acceptance:
+    RUST_MIN_STACK=8388608 cargo test --locked --features development-http --lib actual_native_schema_one_unsequenced_heads_replay -- --ignored
 
 replica-admission-acceptance:
     cargo test --locked --features development-http --lib actual_native_replica_admission_preserves_pending_and_local_reads -- --ignored

@@ -1725,10 +1725,15 @@ mod tests {
     }
     // Only this disposable fixture is written. Never downgrade an open
     // production journal to simulate an earlier release.
-    fn schema_one_fixture(
+    type LegacyFixtureRow = (String, String, u64, u64, Vec<u8>);
+    fn legacy_fixture(
         source: &std::path::Path,
         destination: &std::path::Path,
-    ) -> Result<Vec<(String, String, u64, Vec<u8>)>, Error> {
+        version: u32,
+    ) -> Result<Vec<LegacyFixtureRow>, Error> {
+        if !matches!(version, 1 | 2) {
+            return Err(Error::Invalid);
+        }
         let mut current = rusqlite::Connection::open_with_flags(
             source,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1750,14 +1755,20 @@ mod tests {
             .map_err(dependency)?;
         let rows = {
             let mut query = tx
-                .prepare("SELECT kind,id,revision,body FROM v3_entities ORDER BY kind,id LIMIT 129")
+                .prepare("SELECT kind,id,revision,server_seq,body FROM v3_entities ORDER BY kind,id LIMIT 129")
                 .map_err(dependency)?;
             query
                 .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })
                 .map_err(dependency)?
-                .collect::<Result<Vec<(String, String, u64, Vec<u8>)>, _>>()
+                .collect::<Result<Vec<LegacyFixtureRow>, _>>()
                 .map_err(dependency)?
         };
         if rows.is_empty() || rows.len() > 128 {
@@ -1774,17 +1785,28 @@ mod tests {
             CREATE TABLE outbox(id TEXT PRIMARY KEY,kind TEXT NOT NULL,entity_id TEXT NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),state TEXT NOT NULL CHECK(state IN ('pending','conflict')));
             CREATE TABLE entities(kind TEXT NOT NULL,id TEXT NOT NULL,revision INTEGER NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),PRIMARY KEY(kind,id));
             CREATE TABLE conflicts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,entity_id TEXT NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),result BLOB NOT NULL);").map_err(dependency)?;
+        if version == 2 {
+            tx.execute_batch("ALTER TABLE entities ADD COLUMN server_seq INTEGER NOT NULL DEFAULT 0 CHECK(server_seq BETWEEN 0 AND 9007199254740991);").map_err(dependency)?;
+        }
         tx.execute(
-            "INSERT INTO meta(singleton,schema_version,cursor) VALUES(1,1,?1)",
-            [cursor],
+            "INSERT INTO meta(singleton,schema_version,cursor) VALUES(1,?1,?2)",
+            rusqlite::params![version, cursor],
         )
         .map_err(dependency)?;
-        for (kind, id, revision, body) in &rows {
-            tx.execute(
-                "INSERT INTO entities(kind,id,revision,body) VALUES(?1,?2,?3,?4)",
-                rusqlite::params![kind, id, revision, body],
-            )
-            .map_err(dependency)?;
+        for (kind, id, revision, sequence, body) in &rows {
+            if version == 1 {
+                tx.execute(
+                    "INSERT INTO entities(kind,id,revision,body) VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![kind, id, revision, body],
+                )
+                .map_err(dependency)?;
+            } else {
+                tx.execute(
+                    "INSERT INTO entities(kind,id,revision,server_seq,body) VALUES(?1,?2,?3,?4,?5)",
+                    rusqlite::params![kind, id, revision, sequence, body],
+                )
+                .map_err(dependency)?;
+            }
         }
         tx.commit().map_err(dependency)?;
         Ok(rows)
@@ -2267,7 +2289,7 @@ mod tests {
             let (newer, plain) = vault.clipboard().await?.unwrap();
             assert_eq!(newer.server_seq, 38);
             assert_eq!(plain.as_str(), "A later committed clipboard item");
-            // A distinct schema1 fixture contains the actual committed
+            // A distinct schema2 fixture contains the actual committed
             // ciphertext under the same native key and original scope. Open it
             // through the real migration, then recover receipts by signed replay.
             phase = "retained schema migration";
@@ -2278,7 +2300,7 @@ mod tests {
             let current_path = vault.journal.path_for_acceptance();
             let legacy_path = sync_directory.join(current_path.file_name().ok_or(Error::Invalid)?);
             phase = "legacy fixture ciphertext capture";
-            let retained = schema_one_fixture(&current_path, &legacy_path)?;
+            let retained = legacy_fixture(&current_path, &legacy_path, 2)?;
             phase = "legacy fixture forward migration";
             let migrated = VaultClient::new(identity.clone(), legacy_directory).await?;
             {
@@ -2287,7 +2309,7 @@ mod tests {
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )
                 .map_err(dependency)?;
-                for (kind, id, revision, body) in &retained {
+                for (kind, id, revision, _sequence, body) in &retained {
                     let actual: (u64, Vec<u8>) = db
                         .query_row(
                             "SELECT revision,body FROM v3_entities WHERE kind=?1 AND id=?2",
@@ -2578,6 +2600,64 @@ mod tests {
         ));
         std::fs::remove_dir_all(directory).unwrap();
         outcome.unwrap_or_else(|error| panic!("native vault acceptance phase {phase}: {error}"));
+    }
+    #[tokio::test]
+    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and isolated native credentials; schema1 replay qualification"]
+    async fn actual_native_schema_one_unsequenced_heads_replay() {
+        let (_receipt, identity) = fixture_identity().await;
+        let directory =
+            std::env::temp_dir().join(format!("nds-schema-one-{}", uuid::Uuid::new_v4()));
+        let vault = VaultClient::new(identity.clone(), directory.clone())
+            .await
+            .unwrap();
+        let store = identity.vault_credentials().unwrap();
+        let outcome = async {
+            vault.refresh().await?;
+            for (revision, value) in [(0, "Original"), (1, "Newer")] {
+                vault
+                    .save_record(
+                        Some("legacy-record".into()),
+                        revision,
+                        None,
+                        "Legacy migration".into(),
+                        String::new(),
+                        Zeroizing::new(value.into()),
+                    )
+                    .await?;
+                let completed = vault.synchronize().await?;
+                assert!(!completed.catching_up && completed.pending == 0);
+            }
+            let legacy_directory = directory.join("legacy");
+            std::fs::create_dir(&legacy_directory).map_err(dependency)?;
+            let sync = legacy_directory.join("sync");
+            std::fs::create_dir(&sync).map_err(dependency)?;
+            let current = vault.journal.path_for_acceptance();
+            let legacy = sync.join(current.file_name().ok_or(Error::Invalid)?);
+            let retained = legacy_fixture(&current, &legacy, 1)?;
+            assert_eq!(retained.len(), 1);
+            let migrated = VaultClient::new(identity.clone(), legacy_directory).await?;
+            let mut completed = migrated.synchronize().await?;
+            for _ in 0..16 {
+                if !completed.catching_up {
+                    break;
+                }
+                completed = migrated.synchronize().await?;
+            }
+            assert!(!completed.catching_up && completed.cursor == 2);
+            assert_eq!(
+                migrated
+                    .native_secret("legacy-record".into())
+                    .await?
+                    .as_str(),
+                "Newer"
+            );
+            Ok::<_, Error>(())
+        }
+        .await;
+        store.delete().await.unwrap();
+        identity.logout().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        outcome.unwrap_or_else(|error| panic!("schema1 original-head replay: {error}"));
     }
     #[tokio::test]
     #[ignore = "requires an owned byte-bounded PostgreSQL/Mailpit fixture and actual native credentials"]
