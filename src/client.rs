@@ -2014,12 +2014,15 @@ mod tests {
             .await
             .unwrap();
         let store = identity.vault_credentials().unwrap();
+        let mut phase = "initial key and replica refresh";
         let outcome = async {
             let created = vault.refresh().await?;
             assert!(created.unlocked && created.cursor == 0);
+            phase = "local write during unanswered synchronization";
             Box::pin(concurrent_offline_write(identity.clone(),directory.join("concurrent-probe"),&receipt)).await?;
             let key = store.read().await.map_err(dependency)?.unwrap();
             let secret = "PRIVATE_ACTUAL_VAULT_VALUE";
+            phase = "first durable record and signed append";
             vault
                 .save_record(
                     Some("acceptance-record".into()),
@@ -2069,6 +2072,7 @@ mod tests {
                     },
                 },
             ];
+            phase = "device and account state publication";
             vault.publish_states(states.clone()).await?;
             let mut unchanged = states;
             for value in &mut unchanged {
@@ -2100,6 +2104,7 @@ mod tests {
                     .as_str(),
                 secret
             );
+            phase = "native key and journal recreation";
             let restarted = VaultClient::new(identity.clone(), directory.clone()).await?;
             assert_eq!(restarted.refresh().await?.key_id, created.key_id);
             assert_eq!(restarted.states(String::new()).await?.items.len(), 2);
@@ -2117,6 +2122,7 @@ mod tests {
             // Large real ciphertext entries exceed one byte-bounded catch-up
             // batch even when the server permits 100 small entries per page.
             // A partial observation must not advance durable freshness.
+            phase = "byte-bounded ciphertext catch-up";
             for index in 0..33 {
                 vault
                     .save_record(
@@ -2142,6 +2148,7 @@ mod tests {
             let complete = fresh.synchronize().await?;
             assert!(!complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0);
             assert_eq!(fresh.records(String::new()).await?.items.len(), 34);
+            phase = "encrypted clipboard synchronization";
             let clipboard_text="Actual encrypted shared clipboard: проверка";
             vault.share_clipboard(Zeroizing::new(clipboard_text.into())).await?;
             let mut synced=vault.synchronize().await?;
@@ -2160,6 +2167,7 @@ mod tests {
             assert_eq!(newer.server_seq,38);assert_eq!(plain.as_str(),"A later committed clipboard item");
             // Real schema1 migration preserves ciphertext and receipts. Replaying
             // recovers committed sequence without resetting any native key.
+            phase = "retained schema migration";
             let path=vault.journal.path_for_acceptance();
             let sqlite=rusqlite::Connection::open(&path).map_err(dependency)?;
             sqlite.execute_batch("DROP VIEW local_entities; DROP VIEW meta; ALTER TABLE replica_meta RENAME TO meta; ALTER TABLE replica_outbox RENAME TO outbox; ALTER TABLE replica_entities RENAME TO entities; ALTER TABLE replica_conflicts RENAME TO conflicts; DROP INDEX outbox_unsent; DROP INDEX outbox_dispatched; DROP INDEX conflict_entity; ALTER TABLE outbox DROP COLUMN predecessor; ALTER TABLE outbox DROP COLUMN dispatched; ALTER TABLE meta DROP COLUMN last_sync_at; ALTER TABLE meta DROP COLUMN local_revision; ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
@@ -2170,6 +2178,7 @@ mod tests {
             assert_eq!(migrated.clipboard().await?.unwrap().0.server_seq,38);
             // Two independent durable replicas retain competing edits. Both
             // deny native use until a revision/cursor-bound owner decision lands.
+            phase = "independent replica conflict resolution";
             vault.save_record(Some("acceptance-record".into()), 1, None, "Server edit".into(), "test-user".into(), Zeroizing::new(secret.into())).await?;
             fresh.save_record(Some("acceptance-record".into()), 1, None, "Competing edit".into(), "test-user".into(), Zeroizing::new("PRIVATE_COMPETING_VALUE".into())).await?;
             vault.synchronize().await?; fresh.synchronize().await?; vault.synchronize().await?;
@@ -2183,6 +2192,7 @@ mod tests {
             fresh.synchronize().await?; vault.synchronize().await?;
             assert_eq!(vault.snapshot().conflicts, 0); assert_eq!(fresh.snapshot().conflicts, 0);
             assert_eq!(vault.native_secret("acceptance-record".into()).await?.as_str(), secret);
+            phase = "multi-page record publication";
             for index in 0..120 {
                 vault.save_record(Some(format!("bulk-{index:03}")), 0, None, format!("Page record {index}"), String::new(), Zeroizing::new("PRIVATE_PAGE_VALUE".into())).await?;
             }
@@ -2192,6 +2202,7 @@ mod tests {
             assert!(!fresh.snapshot().catching_up);
             // A stale edit of a deleted record must remain visible as a
             // resolvable conflict. Choosing it restores only that chosen value.
+            phase = "deleted record conflict resolution";
             vault.delete_record("bulk-000".into(), 1, None).await?;
             fresh.save_record(Some("bulk-000".into()), 1, None, "Restore chosen edit".into(), String::new(), Zeroizing::new("PRIVATE_RESTORED_VALUE".into())).await?;
             vault.synchronize().await?; fresh.synchronize().await?;
@@ -2200,6 +2211,7 @@ mod tests {
             fresh.resolve_record(record.id, record.revision, record.observed_seq, None, true).await?;
             fresh.synchronize().await?; vault.synchronize().await?;
             assert_eq!(vault.native_secret("bulk-000".into()).await?.as_str(), "PRIVATE_RESTORED_VALUE");
+            phase = "bounded local pagination";
             for index in 1..=5 { vault.delete_record(format!("bulk-{index:03}"), 1, None).await?; }
             vault.synchronize().await?;
             let mut after = String::new(); let mut ids = std::collections::BTreeSet::new();
@@ -2215,6 +2227,7 @@ mod tests {
             // An authenticated but corrupt server record must not advance the
             // verified inbox cursor or freshness. This poisons only this owned
             // disposable server; production has no reset/repair bypass.
+            phase = "authenticated ciphertext tamper refusal";
             let cursor = vault.journal.cursor().await?;
             fresh.save_record(Some("before-invalid".into()), 0, None, "Valid preceding record".into(), String::new(), Zeroizing::new("PRIVATE_VALID_PREFIX".into())).await?;
             for _ in 0..16 { if !fresh.synchronize().await?.catching_up { break; } }
@@ -2254,7 +2267,7 @@ mod tests {
             Err(Error::Locked)
         ));
         std::fs::remove_dir_all(directory).unwrap();
-        outcome.unwrap();
+        outcome.unwrap_or_else(|error| panic!("native vault acceptance phase {phase}: {error}"));
     }
     #[tokio::test]
     #[ignore = "requires an owned byte-bounded PostgreSQL/Mailpit fixture and actual native credentials"]
