@@ -1729,6 +1729,10 @@ mod tests {
         receipt: &serde_json::Value,
     ) -> Result<(), Error> {
         let probe = Arc::new(VaultClient::new(identity.clone(), directory.clone()).await?);
+        // This independent replica must establish its own writer/key facts
+        // while online before the outage. Another replica's refresh is not
+        // admission for this new journal.
+        probe.refresh().await?;
         fixture_mode(receipt, "offline").await?;
         let result = async {
             let address = receipt["base_url"]
