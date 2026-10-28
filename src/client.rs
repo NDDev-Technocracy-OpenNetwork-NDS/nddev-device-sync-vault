@@ -1723,6 +1723,72 @@ mod tests {
         .await
         .map_err(dependency)?
     }
+    // Only this disposable fixture is written. Never downgrade an open
+    // production journal to simulate an earlier release.
+    fn schema_one_fixture(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> Result<Vec<(String, String, u64, Vec<u8>)>, Error> {
+        let mut current = rusqlite::Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(dependency)?;
+        let tx = current.transaction().map_err(dependency)?;
+        let pending: u64 = tx
+            .query_row(
+                "SELECT (SELECT count(*) FROM v3_outbox)+(SELECT count(*) FROM v3_conflicts)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(dependency)?;
+        if pending != 0 {
+            return Err(Error::Invalid);
+        }
+        let cursor: u64 = tx
+            .query_row("SELECT cursor FROM v3_meta", [], |row| row.get(0))
+            .map_err(dependency)?;
+        let rows = {
+            let mut query = tx
+                .prepare("SELECT kind,id,revision,body FROM v3_entities ORDER BY kind,id LIMIT 129")
+                .map_err(dependency)?;
+            query
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .map_err(dependency)?
+                .collect::<Result<Vec<(String, String, u64, Vec<u8>)>, _>>()
+                .map_err(dependency)?
+        };
+        if rows.is_empty() || rows.len() > 128 {
+            return Err(Error::Invalid);
+        }
+        tx.commit().map_err(dependency)?;
+        let mut legacy = rusqlite::Connection::open_with_flags(
+            destination,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .map_err(dependency)?;
+        let tx = legacy.transaction().map_err(dependency)?;
+        tx.execute_batch("CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,cursor INTEGER NOT NULL DEFAULT 0 CHECK(cursor BETWEEN 0 AND 9007199254740991));
+            CREATE TABLE outbox(id TEXT PRIMARY KEY,kind TEXT NOT NULL,entity_id TEXT NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),state TEXT NOT NULL CHECK(state IN ('pending','conflict')));
+            CREATE TABLE entities(kind TEXT NOT NULL,id TEXT NOT NULL,revision INTEGER NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),PRIMARY KEY(kind,id));
+            CREATE TABLE conflicts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,entity_id TEXT NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),result BLOB NOT NULL);").map_err(dependency)?;
+        tx.execute(
+            "INSERT INTO meta(singleton,schema_version,cursor) VALUES(1,1,?1)",
+            [cursor],
+        )
+        .map_err(dependency)?;
+        for (kind, id, revision, body) in &rows {
+            tx.execute(
+                "INSERT INTO entities(kind,id,revision,body) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![kind, id, revision, body],
+            )
+            .map_err(dependency)?;
+        }
+        tx.commit().map_err(dependency)?;
+        Ok(rows)
+    }
     async fn concurrent_offline_write(
         identity: Arc<IdentityClient>,
         directory: PathBuf,
@@ -2023,7 +2089,12 @@ mod tests {
             let created = vault.refresh().await?;
             assert!(created.unlocked && created.cursor == 0);
             phase = "local write during unanswered synchronization";
-            Box::pin(concurrent_offline_write(identity.clone(),directory.join("concurrent-probe"),&receipt)).await?;
+            Box::pin(concurrent_offline_write(
+                identity.clone(),
+                directory.join("concurrent-probe"),
+                &receipt,
+            ))
+            .await?;
             let key = store.read().await.map_err(dependency)?.unwrap();
             let secret = "PRIVATE_ACTUAL_VAULT_VALUE";
             phase = "first durable record and signed append";
@@ -2031,7 +2102,8 @@ mod tests {
                 .save_record(
                     Some("acceptance-record".into()),
                     0,
-                    None, "Acceptance record".into(),
+                    None,
+                    "Acceptance record".into(),
                     "test-user".into(),
                     Zeroizing::new(secret.into()),
                 )
@@ -2132,7 +2204,8 @@ mod tests {
                     .save_record(
                         Some(format!("catchup-{index}")),
                         0,
-                        None, format!("Record {index}"),
+                        None,
+                        format!("Record {index}"),
                         String::new(),
                         Zeroizing::new("x".repeat(16_000)),
                     )
@@ -2153,86 +2226,252 @@ mod tests {
             // finite number of batches rather than assuming a fixed page count.
             let mut complete = partial;
             for _ in 0..16 {
-                if !complete.catching_up { break; }
+                if !complete.catching_up {
+                    break;
+                }
                 complete = fresh.synchronize().await?;
             }
-            assert!(!complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0,
+            assert!(
+                !complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0,
                 "bounded catch-up: cursor={}, pending={}, catching_up={}, fresh={}",
-                complete.cursor, complete.pending, complete.catching_up, complete.last_sync_at > 0);
+                complete.cursor,
+                complete.pending,
+                complete.catching_up,
+                complete.last_sync_at > 0
+            );
             assert_eq!(fresh.records(String::new()).await?.items.len(), 34);
             phase = "encrypted clipboard synchronization";
-            let clipboard_text="Actual encrypted shared clipboard: проверка";
-            vault.share_clipboard(Zeroizing::new(clipboard_text.into())).await?;
-            let mut synced=vault.synchronize().await?;
-            while synced.catching_up {synced=vault.synchronize().await?;}
+            let clipboard_text = "Actual encrypted shared clipboard: проверка";
+            vault
+                .share_clipboard(Zeroizing::new(clipboard_text.into()))
+                .await?;
+            let mut synced = vault.synchronize().await?;
+            while synced.catching_up {
+                synced = vault.synchronize().await?;
+            }
             fresh.synchronize().await?;
-            let (received,plain)=fresh.clipboard().await?.unwrap();
-            assert_eq!(plain.as_str(),clipboard_text);
-            assert_eq!(received.server_seq,37);
-            assert_eq!(received.device_id,current.device_id);
-            let cursor=vault.snapshot().cursor;
-            vault.share_clipboard(Zeroizing::new(clipboard_text.into())).await?;
-            assert_eq!(vault.synchronize().await?.cursor,cursor);
-            fresh.share_clipboard(Zeroizing::new("A later committed clipboard item".into())).await?;
-            fresh.synchronize().await?;vault.synchronize().await?;
-            let (newer,plain)=vault.clipboard().await?.unwrap();
-            assert_eq!(newer.server_seq,38);assert_eq!(plain.as_str(),"A later committed clipboard item");
-            // Real schema1 migration preserves ciphertext and receipts. Replaying
-            // recovers committed sequence without resetting any native key.
+            let (received, plain) = fresh.clipboard().await?.unwrap();
+            assert_eq!(plain.as_str(), clipboard_text);
+            assert_eq!(received.server_seq, 37);
+            assert_eq!(received.device_id, current.device_id);
+            let cursor = vault.snapshot().cursor;
+            vault
+                .share_clipboard(Zeroizing::new(clipboard_text.into()))
+                .await?;
+            assert_eq!(vault.synchronize().await?.cursor, cursor);
+            fresh
+                .share_clipboard(Zeroizing::new("A later committed clipboard item".into()))
+                .await?;
+            fresh.synchronize().await?;
+            vault.synchronize().await?;
+            let (newer, plain) = vault.clipboard().await?.unwrap();
+            assert_eq!(newer.server_seq, 38);
+            assert_eq!(plain.as_str(), "A later committed clipboard item");
+            // A distinct schema1 fixture contains the actual committed
+            // ciphertext under the same native key and original scope. Open it
+            // through the real migration, then recover receipts by signed replay.
             phase = "retained schema migration";
-            let path=vault.journal.path_for_acceptance();
-            let sqlite=rusqlite::Connection::open(&path).map_err(dependency)?;
-            sqlite.execute_batch("DROP VIEW local_entities; DROP VIEW meta; ALTER TABLE replica_meta RENAME TO meta; ALTER TABLE replica_outbox RENAME TO outbox; ALTER TABLE replica_entities RENAME TO entities; ALTER TABLE replica_conflicts RENAME TO conflicts; DROP INDEX outbox_unsent; DROP INDEX outbox_dispatched; DROP INDEX conflict_entity; ALTER TABLE outbox DROP COLUMN predecessor; ALTER TABLE outbox DROP COLUMN dispatched; ALTER TABLE meta DROP COLUMN last_sync_at; ALTER TABLE meta DROP COLUMN local_revision; ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
-            let migrated=VaultClient::new(identity.clone(),directory.clone()).await?;
-            assert!(matches!(migrated.clipboard().await,Err(Error::Busy)));
-            let mut progress=migrated.synchronize().await?;while progress.catching_up{progress=migrated.synchronize().await?;}
-            assert_eq!(migrated.native_secret("acceptance-record".into()).await?.as_str(),secret);
-            assert_eq!(migrated.clipboard().await?.unwrap().0.server_seq,38);
+            let legacy_directory = directory.join("legacy-replica");
+            std::fs::create_dir(&legacy_directory).map_err(dependency)?;
+            let sync_directory = legacy_directory.join("sync");
+            std::fs::create_dir(&sync_directory).map_err(dependency)?;
+            let current_path = vault.journal.path_for_acceptance();
+            let legacy_path = sync_directory.join(current_path.file_name().ok_or(Error::Invalid)?);
+            let retained = schema_one_fixture(&current_path, &legacy_path)?;
+            let migrated = VaultClient::new(identity.clone(), legacy_directory).await?;
+            {
+                let db = rusqlite::Connection::open_with_flags(
+                    &legacy_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .map_err(dependency)?;
+                for (kind, id, revision, body) in &retained {
+                    let actual: (u64, Vec<u8>) = db
+                        .query_row(
+                            "SELECT revision,body FROM v3_entities WHERE kind=?1 AND id=?2",
+                            rusqlite::params![kind, id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(dependency)?;
+                    assert!(
+                        actual.0 == *revision && actual.1 == *body,
+                        "migration changed a retained ciphertext or revision"
+                    );
+                }
+            }
+            assert!(matches!(migrated.clipboard().await, Err(Error::Busy)));
+            let mut progress = migrated.synchronize().await?;
+            while progress.catching_up {
+                progress = migrated.synchronize().await?;
+            }
+            assert_eq!(
+                migrated
+                    .native_secret("acceptance-record".into())
+                    .await?
+                    .as_str(),
+                secret
+            );
+            assert_eq!(migrated.clipboard().await?.unwrap().0.server_seq, 38);
             // Two independent durable replicas retain competing edits. Both
             // deny native use until a revision/cursor-bound owner decision lands.
             phase = "independent replica conflict resolution";
-            vault.save_record(Some("acceptance-record".into()), 1, None, "Server edit".into(), "test-user".into(), Zeroizing::new(secret.into())).await?;
-            fresh.save_record(Some("acceptance-record".into()), 1, None, "Competing edit".into(), "test-user".into(), Zeroizing::new("PRIVATE_COMPETING_VALUE".into())).await?;
-            vault.synchronize().await?; fresh.synchronize().await?; vault.synchronize().await?;
-            assert!(matches!(vault.native_secret("acceptance-record".into()).await, Err(Error::Busy)));
-            assert!(matches!(fresh.native_secret("acceptance-record".into()).await, Err(Error::Busy)));
-            let record = fresh.records(String::new()).await?.items.into_iter().find(|record| record.id == "acceptance-record").unwrap();
-            assert!(record.conflicted && record.conflict.as_ref().unwrap().title == "Competing edit");
-            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision - 1, record.observed_seq, None, false).await, Err(Error::Busy)));
-            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision, record.observed_seq - 1, None, false).await, Err(Error::Busy)));
-            fresh.resolve_record(record.id, record.revision, record.observed_seq, None, false).await?;
-            fresh.synchronize().await?; vault.synchronize().await?;
-            assert_eq!(vault.snapshot().conflicts, 0); assert_eq!(fresh.snapshot().conflicts, 0);
-            assert_eq!(vault.native_secret("acceptance-record".into()).await?.as_str(), secret);
+            vault
+                .save_record(
+                    Some("acceptance-record".into()),
+                    1,
+                    None,
+                    "Server edit".into(),
+                    "test-user".into(),
+                    Zeroizing::new(secret.into()),
+                )
+                .await?;
+            fresh
+                .save_record(
+                    Some("acceptance-record".into()),
+                    1,
+                    None,
+                    "Competing edit".into(),
+                    "test-user".into(),
+                    Zeroizing::new("PRIVATE_COMPETING_VALUE".into()),
+                )
+                .await?;
+            vault.synchronize().await?;
+            fresh.synchronize().await?;
+            vault.synchronize().await?;
+            assert!(matches!(
+                vault.native_secret("acceptance-record".into()).await,
+                Err(Error::Busy)
+            ));
+            assert!(matches!(
+                fresh.native_secret("acceptance-record".into()).await,
+                Err(Error::Busy)
+            ));
+            let record = fresh
+                .records(String::new())
+                .await?
+                .items
+                .into_iter()
+                .find(|record| record.id == "acceptance-record")
+                .unwrap();
+            assert!(
+                record.conflicted && record.conflict.as_ref().unwrap().title == "Competing edit"
+            );
+            assert!(matches!(
+                fresh
+                    .resolve_record(
+                        record.id.clone(),
+                        record.revision - 1,
+                        record.observed_seq,
+                        None,
+                        false
+                    )
+                    .await,
+                Err(Error::Busy)
+            ));
+            assert!(matches!(
+                fresh
+                    .resolve_record(
+                        record.id.clone(),
+                        record.revision,
+                        record.observed_seq - 1,
+                        None,
+                        false
+                    )
+                    .await,
+                Err(Error::Busy)
+            ));
+            fresh
+                .resolve_record(record.id, record.revision, record.observed_seq, None, false)
+                .await?;
+            fresh.synchronize().await?;
+            vault.synchronize().await?;
+            assert_eq!(vault.snapshot().conflicts, 0);
+            assert_eq!(fresh.snapshot().conflicts, 0);
+            assert_eq!(
+                vault
+                    .native_secret("acceptance-record".into())
+                    .await?
+                    .as_str(),
+                secret
+            );
             phase = "multi-page record publication";
             for index in 0..120 {
-                vault.save_record(Some(format!("bulk-{index:03}")), 0, None, format!("Page record {index}"), String::new(), Zeroizing::new("PRIVATE_PAGE_VALUE".into())).await?;
+                vault
+                    .save_record(
+                        Some(format!("bulk-{index:03}")),
+                        0,
+                        None,
+                        format!("Page record {index}"),
+                        String::new(),
+                        Zeroizing::new("PRIVATE_PAGE_VALUE".into()),
+                    )
+                    .await?;
             }
-            for _ in 0..16 { if !vault.synchronize().await?.catching_up { break; } }
+            for _ in 0..16 {
+                if !vault.synchronize().await?.catching_up {
+                    break;
+                }
+            }
             assert!(!vault.snapshot().catching_up);
-            for _ in 0..16 { if !fresh.synchronize().await?.catching_up { break; } }
+            for _ in 0..16 {
+                if !fresh.synchronize().await?.catching_up {
+                    break;
+                }
+            }
             assert!(!fresh.snapshot().catching_up);
             // A stale edit of a deleted record must remain visible as a
             // resolvable conflict. Choosing it restores only that chosen value.
             phase = "deleted record conflict resolution";
             vault.delete_record("bulk-000".into(), 1, None).await?;
-            fresh.save_record(Some("bulk-000".into()), 1, None, "Restore chosen edit".into(), String::new(), Zeroizing::new("PRIVATE_RESTORED_VALUE".into())).await?;
-            vault.synchronize().await?; fresh.synchronize().await?;
-            let record = fresh.records(String::new()).await?.items.into_iter().find(|record| record.id == "bulk-000").unwrap();
-            assert!(record.deleted && record.conflicted);
-            fresh.resolve_record(record.id, record.revision, record.observed_seq, None, true).await?;
-            fresh.synchronize().await?; vault.synchronize().await?;
-            assert_eq!(vault.native_secret("bulk-000".into()).await?.as_str(), "PRIVATE_RESTORED_VALUE");
-            phase = "bounded local pagination";
-            for index in 1..=5 { vault.delete_record(format!("bulk-{index:03}"), 1, None).await?; }
+            fresh
+                .save_record(
+                    Some("bulk-000".into()),
+                    1,
+                    None,
+                    "Restore chosen edit".into(),
+                    String::new(),
+                    Zeroizing::new("PRIVATE_RESTORED_VALUE".into()),
+                )
+                .await?;
             vault.synchronize().await?;
-            let mut after = String::new(); let mut ids = std::collections::BTreeSet::new();
+            fresh.synchronize().await?;
+            let record = fresh
+                .records(String::new())
+                .await?
+                .items
+                .into_iter()
+                .find(|record| record.id == "bulk-000")
+                .unwrap();
+            assert!(record.deleted && record.conflicted);
+            fresh
+                .resolve_record(record.id, record.revision, record.observed_seq, None, true)
+                .await?;
+            fresh.synchronize().await?;
+            vault.synchronize().await?;
+            assert_eq!(
+                vault.native_secret("bulk-000".into()).await?.as_str(),
+                "PRIVATE_RESTORED_VALUE"
+            );
+            phase = "bounded local pagination";
+            for index in 1..=5 {
+                vault
+                    .delete_record(format!("bulk-{index:03}"), 1, None)
+                    .await?;
+            }
+            vault.synchronize().await?;
+            let mut after = String::new();
+            let mut ids = std::collections::BTreeSet::new();
             for _ in 0..8 {
                 let page = vault.records(after.clone()).await?;
                 assert!(page.items.len() <= 50);
-                for record in page.items { assert!(ids.insert(record.id)); }
-                if !page.has_more { break; }
-                assert!(page.next_after > after); after = page.next_after;
+                for record in page.items {
+                    assert!(ids.insert(record.id));
+                }
+                if !page.has_more {
+                    break;
+                }
+                assert!(page.next_after > after);
+                after = page.next_after;
             }
             assert_eq!(ids.len(), 149);
             assert!(ids.contains("bulk-119") && ids.contains("catchup-9"));
@@ -2241,23 +2480,79 @@ mod tests {
             // disposable server; production has no reset/repair bypass.
             phase = "authenticated ciphertext tamper refusal";
             let cursor = vault.journal.cursor().await?;
-            fresh.save_record(Some("before-invalid".into()), 0, None, "Valid preceding record".into(), String::new(), Zeroizing::new("PRIVATE_VALID_PREFIX".into())).await?;
-            for _ in 0..16 { if !fresh.synchronize().await?.catching_up { break; } }
+            fresh
+                .save_record(
+                    Some("before-invalid".into()),
+                    0,
+                    None,
+                    "Valid preceding record".into(),
+                    String::new(),
+                    Zeroizing::new("PRIVATE_VALID_PREFIX".into()),
+                )
+                .await?;
+            for _ in 0..16 {
+                if !fresh.synchronize().await?.catching_up {
+                    break;
+                }
+            }
             assert!(!fresh.snapshot().catching_up);
             let native_key = vault.key().await?.unwrap();
-            let mut invalid = Operation { id: uuid::Uuid::new_v4().to_string(), device: DeviceId::new(&vault.scope.device).unwrap(), entity_kind: EntityKind::VaultRecord, entity_id: "invalid-authentication".into(), base_revision: 0, idempotency_key: uuid::Uuid::new_v4().to_string(), payload: EncryptedPayload { key_id: native_key.id(), nonce: [0; 12], ciphertext: Vec::new() } };
-            let plaintext = Zeroizing::new(serde_json::to_vec(&Record { version: 1, deleted: false, title: "Invalid fixture record".into(), username: String::new(), secret: Zeroizing::new("PRIVATE_TAMPER_VALUE".into()), resolved_through_seq: 0 }).unwrap());
+            let mut invalid = Operation {
+                id: uuid::Uuid::new_v4().to_string(),
+                device: DeviceId::new(&vault.scope.device).unwrap(),
+                entity_kind: EntityKind::VaultRecord,
+                entity_id: "invalid-authentication".into(),
+                base_revision: 0,
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                payload: EncryptedPayload {
+                    key_id: native_key.id(),
+                    nonce: [0; 12],
+                    ciphertext: Vec::new(),
+                },
+            };
+            let plaintext = Zeroizing::new(
+                serde_json::to_vec(&Record {
+                    version: 1,
+                    deleted: false,
+                    title: "Invalid fixture record".into(),
+                    username: String::new(),
+                    secret: Zeroizing::new("PRIVATE_TAMPER_VALUE".into()),
+                    resolved_through_seq: 0,
+                })
+                .unwrap(),
+            );
             invalid.payload = native_key.encrypt(&vault.scope, &invalid, &plaintext)?;
             invalid.payload.ciphertext[0] ^= 1;
-            let accepted = identity.sync_request(SyncRequest::Append(codec::body(&invalid)?)).await.map_err(dependency)?;
+            let accepted = identity
+                .sync_request(SyncRequest::Append(codec::body(&invalid)?))
+                .await
+                .map_err(dependency)?;
             assert_eq!(accepted.status, 201);
             let freshness = vault.snapshot().last_sync_at;
-            assert!(matches!(vault.synchronize().await, Err(Error::Authentication)));
+            assert!(matches!(
+                vault.synchronize().await,
+                Err(Error::Authentication)
+            ));
             assert_eq!(vault.journal.cursor().await?, cursor);
             assert_eq!(vault.snapshot().last_sync_at, freshness);
-            assert!(vault.journal.entity("vault_record", "invalid-authentication").await?.is_none());
-            assert!(vault.journal.entity("vault_record", "before-invalid").await?.is_none());
-            assert_eq!(store.read().await.map_err(dependency)?.unwrap().as_slice(), key.as_slice());
+            assert!(
+                vault
+                    .journal
+                    .entity("vault_record", "invalid-authentication")
+                    .await?
+                    .is_none()
+            );
+            assert!(
+                vault
+                    .journal
+                    .entity("vault_record", "before-invalid")
+                    .await?
+                    .is_none()
+            );
+            assert_eq!(
+                store.read().await.map_err(dependency)?.unwrap().as_slice(),
+                key.as_slice()
+            );
             // Actual persisted SQLite bytes contain ciphertext, not native keys
             // or the record's plaintext. Native credentials use a separate store.
             let path = vault.journal.path_for_acceptance();
