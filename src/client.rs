@@ -2277,7 +2277,9 @@ mod tests {
             std::fs::create_dir(&sync_directory).map_err(dependency)?;
             let current_path = vault.journal.path_for_acceptance();
             let legacy_path = sync_directory.join(current_path.file_name().ok_or(Error::Invalid)?);
+            phase = "legacy fixture ciphertext capture";
             let retained = schema_one_fixture(&current_path, &legacy_path)?;
+            phase = "legacy fixture forward migration";
             let migrated = VaultClient::new(identity.clone(), legacy_directory).await?;
             {
                 let db = rusqlite::Connection::open_with_flags(
@@ -2300,6 +2302,7 @@ mod tests {
                 }
             }
             assert!(matches!(migrated.clipboard().await, Err(Error::Busy)));
+            phase = "legacy fixture signed receipt replay";
             let mut progress = migrated.synchronize().await?;
             while progress.catching_up {
                 progress = migrated.synchronize().await?;
