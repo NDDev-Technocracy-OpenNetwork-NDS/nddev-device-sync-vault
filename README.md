@@ -114,7 +114,15 @@ to the local revision in one transaction; mutation attempts return the frozen
 publication receipt, so later metadata cannot relabel an earlier result.
 NDS permission consent does not grant OS/browser access or prove provider readiness.
 
-Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
+Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. That recipe gives the large debug acceptance future an explicit 8 MiB test-thread stack; application thread stacks and resource limits are unchanged. Host checks do not prove another platform's secure-store or UI behavior.
+
+The native lifecycle acceptance migrates an isolated schema2 fixture with its
+retained sequences and actual committed ciphertext. General schema1 replay of
+unsequenced heads remains unqualified: an earlier original can currently refuse
+before the retained head's own receipt is observed. `just legacy-schema-one-acceptance`
+retains the positive real-backend criterion for [issue #125](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault/issues/125).
+This alpha retained-history gate must pass before claiming that transition;
+never guess a missing sequence or downgrade an open journal to simulate it.
 
 `just replica-admission-acceptance` uses a fresh `--fixture-sync3` fixture and
 isolated native credentials. It checks every replica entry, preserves the exact
