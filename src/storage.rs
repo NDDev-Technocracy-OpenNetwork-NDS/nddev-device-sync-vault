@@ -903,14 +903,26 @@ mod admission_tests {
         assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         assert!(matches!(contender.replica_lock(), Err(Error::Busy)));
         connection.execute_batch("ROLLBACK;").unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while observed.strong_count() != 0 {
+        // A zero Arc count does not acknowledge that the native file's Drop
+        // and worker bookkeeping have finished. Observe the actual lock and
+        // both resource releases before declaring the cancelled batch drained.
+        let _next = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match contender.replica_lock() {
+                    Ok(lease)
+                        if storage.io.available_permits() == 1
+                            && storage.admission.available_permits() == 4 =>
+                    {
+                        break lease;
+                    }
+                    Ok(_) | Err(Error::Busy) => {}
+                    Err(error) => panic!("replica lease failed: {error}"),
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        let _next = contender.replica_lock().unwrap();
         assert_eq!(contender.stats().unwrap().3, 77);
         assert_eq!(storage.io.available_permits(), 1);
         assert_eq!(storage.admission.available_permits(), 4);
