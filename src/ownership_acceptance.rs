@@ -56,6 +56,80 @@ async fn current_updates_for(
     .unwrap()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh owned --fixture-sync3 PG/SMTP fixture and isolated native credentials"]
+async fn actual_native_clipboard_reader_follows_retained_owner() {
+    use crate::replication::native::NativeReplica;
+    let mut logger = native_logger();
+    let identity = super::tests::admitted_fixture_identity().await;
+    struct Owned(PathBuf);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory = Owned(
+        std::env::temp_dir().join(format!("nds-clipboard-follower-{}", uuid::Uuid::new_v4())),
+    );
+    let owner = NativeReplica::attach(&identity, directory.0.clone(), None)
+        .await
+        .unwrap();
+    let retained = owner.clone();
+    let path = directory.0.clone();
+    // A joined task contains assertion failures; the parent still stops and
+    // joins the actual native owner before the fresh test directory is removed.
+    let mut scenario = tokio::spawn(Box::pin(async move {
+        let before = current_updates(retained.updates().unwrap(), 0).await;
+        let reader = VaultClient::new(identity.clone(), path).await.unwrap();
+        reader
+            .share_clipboard(Zeroizing::new("SYNTHETIC_NATIVE_FOLLOWER_TEXT".into()))
+            .await
+            .unwrap();
+        retained.wake();
+        let committed = current_updates(retained.updates().unwrap(), before.cursor + 1).await;
+        assert_eq!(committed.pending, 0);
+        assert!(reader.snapshot().catching_up);
+        assert!(matches!(reader.clipboard().await, Err(Error::Busy)));
+        assert!(matches!(reader.synchronize_inbox().await, Err(Error::Busy)));
+
+        let observed = reader.observe_replica_once().await.unwrap();
+        assert!(observed.caught_up && !observed.view.catching_up);
+        assert_eq!(observed.view.cursor, committed.cursor);
+        let (metadata, text) = reader.clipboard().await.unwrap().unwrap();
+        assert!(metadata.present && metadata.server_seq > before.cursor);
+        assert!(metadata.server_seq <= committed.cursor);
+        assert_eq!(text.as_str(), "SYNTHETIC_NATIVE_FOLLOWER_TEXT");
+        assert!(retained.is_running());
+
+        let permit = reader.admitted().unwrap();
+        assert!(matches!(
+            reader.observe_replica_once().await,
+            Err(Error::Busy)
+        ));
+        drop(permit);
+        let captured = reader.begin_replica_observation().await.unwrap();
+        identity.cancel();
+        assert!(matches!(
+            reader.observe_replica(&captured).await,
+            Err(Error::Cancelled | Error::Locked)
+        ));
+        assert!(retained.is_running());
+    }));
+    let outcome = tokio::time::timeout(Duration::from_secs(120), &mut scenario).await;
+    if outcome.is_err() {
+        scenario.abort();
+        let _ = scenario.await;
+    }
+    let shutdown = NativeReplica::shutdown().await;
+    logger.shutdown();
+    shutdown.unwrap();
+    assert!(!owner.is_running());
+    outcome
+        .expect("owned clipboard follower scenario deadline")
+        .unwrap();
+}
+
 type Policy = Arc<Mutex<Arc<Mutex<nddev_device_sync_application::lifecycle::ReplicaSchedule>>>>;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
