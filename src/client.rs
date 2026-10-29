@@ -389,6 +389,12 @@ impl VaultClient {
         if observation.expired() {
             return Err(Error::Busy);
         }
+        let _sync = self
+            .sync_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        let _permit = self.admitted()?;
         self.identity
             .validate_local_use(&observation.fence)
             .await
@@ -434,6 +440,9 @@ impl VaultClient {
             .validate_local_use(&observation.fence)
             .await
             .map_err(identity_failure)?;
+        if observation.expired() {
+            return Err(Error::Busy);
+        }
         *self.view.lock().unwrap_or_else(|error| error.into_inner()) = view.clone();
         Ok(InboxProgress {
             inbox_at_head: view.cursor >= observation.history.head,
@@ -1210,6 +1219,14 @@ impl VaultClient {
     /// typed error/current projection; the caller still presents the upload block.
     pub async fn synchronize_inbox(&self) -> Result<InboxProgress, Error> {
         self.synchronize_batch(true).await
+    }
+    /// Observe the current native replica through this reader's own protected
+    /// authority. Reuses the follower path without acquiring the writer lease,
+    /// sending pending operations or writing durable freshness/capacity state.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn observe_replica_once(&self) -> Result<InboxProgress, Error> {
+        let observation = self.begin_replica_observation().await?;
+        self.observe_replica(&observation).await
     }
     /// Authenticated history metadata for the Core capacity-check policy. A
     /// newer floor alone is never proof that a pending original can be sent.
