@@ -108,9 +108,10 @@ async fn actual_native_clipboard_reader_follows_retained_owner() {
             Err(Error::Busy)
         ));
         drop(permit);
+        let captured = reader.begin_replica_observation().await.unwrap();
         identity.cancel();
         assert!(matches!(
-            reader.observe_replica_once().await,
+            reader.observe_replica(&captured).await,
             Err(Error::Cancelled | Error::Locked)
         ));
         assert!(retained.is_running());
