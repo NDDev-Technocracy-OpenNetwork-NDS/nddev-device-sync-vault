@@ -24,6 +24,10 @@ replica-owner-acceptance:
 retained-runtime-acceptance:
     cargo test --locked --features development-http --lib actual_retained_runtime_survives_facade_cancellation_and_reuses_policy -- --ignored
 
+# Fresh owned fixture and private native credentials; retained writer stays live.
+clipboard-follower-acceptance:
+    RUST_MIN_STACK=8388608 cargo test --locked --features development-http --lib actual_native_clipboard_reader_follows_retained_owner -- --ignored
+
 # Fresh owned fixture; actual production capacity and native owner handoff.
 capacity-owner-acceptance:
     cargo test --locked --features development-http --lib actual_capacity_refusal_survives_owner_handoff_without_original_rewrite -- --ignored
