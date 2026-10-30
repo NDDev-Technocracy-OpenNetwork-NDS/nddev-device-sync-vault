@@ -175,6 +175,32 @@ impl VaultClient {
             .try_acquire_owned()
             .map_err(|_| Error::Busy)
     }
+    /// Keep the original protected authority across key and journal I/O. A
+    /// same-owner reauthentication is not permission to deliver an older read.
+    /// The caller retains its ordinary local-operation permit through this
+    /// final check; no authority or resource mutex crosses an await.
+    async fn protected_read<T>(
+        &self,
+        read: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let lifetime = self.identity.local_use_lifetime();
+        let fence = self
+            .identity
+            .local_use_fence_from(&lifetime)
+            .await
+            .map_err(identity_failure)?;
+        self.authorized()?;
+        let value = read.await?;
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        self.authorized()?;
+        self.identity
+            .check_local_use_lifetime(&fence)
+            .map_err(identity_failure)?;
+        Ok(value)
+    }
     async fn key(&self) -> Result<Option<VaultKey>, Error> {
         if let Err(error) = self.identity.authorize_local().await {
             let error = identity_failure(error);
@@ -780,28 +806,31 @@ impl VaultClient {
         if self.snapshot().catching_up || self.snapshot().last_sync_at == 0 {
             return Err(Error::Busy);
         }
-        let key = self.key().await?.ok_or(Error::Locked)?;
-        let Some((id, entity)) = self.journal.latest_clipboard().await? else {
-            return Ok(None);
-        };
-        let envelope = codec::versioned(&entity.body)?;
-        let operation = &envelope.operation;
-        let plaintext = key.decrypt_versioned(&self.scope, &envelope)?;
-        let value: nddev_device_sync_domain::clipboard::Text =
-            serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
-        value.validate().map_err(|_| Error::Invalid)?;
-        let metadata = crate::view::ClipboardView {
-            present: true,
-            id,
-            device_id: operation.device.as_str().into(),
-            server_seq: entity.server_seq,
-            bytes: value.text.len() as u32,
-            conflicted: entity.conflicted,
-        };
-        if entity.conflicted {
-            return Err(Error::Busy);
-        }
-        Ok(Some((metadata, value.text)))
+        self.protected_read(async {
+            let key = self.key().await?.ok_or(Error::Locked)?;
+            let Some((id, entity)) = self.journal.latest_clipboard().await? else {
+                return Ok(None);
+            };
+            let envelope = codec::versioned(&entity.body)?;
+            let operation = &envelope.operation;
+            let plaintext = key.decrypt_versioned(&self.scope, &envelope)?;
+            let value: nddev_device_sync_domain::clipboard::Text =
+                serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+            value.validate().map_err(|_| Error::Invalid)?;
+            let metadata = crate::view::ClipboardView {
+                present: true,
+                id,
+                device_id: operation.device.as_str().into(),
+                server_seq: entity.server_seq,
+                bytes: value.text.len() as u32,
+                conflicted: entity.conflicted,
+            };
+            if entity.conflicted {
+                return Err(Error::Busy);
+            }
+            Ok(Some((metadata, value.text)))
+        })
+        .await
     }
     pub async fn save_record(
         &self,
@@ -926,57 +955,61 @@ impl VaultClient {
         if !after.is_empty() && nddev_device_sync_domain::ModuleId::new(&after).is_err() {
             return Err(Error::Invalid);
         }
-        let key = self.key().await?.ok_or(Error::Locked)?;
-        let (mut entities, observed_seq, local_revision) = self.journal.record_page(after).await?;
-        let has_more = entities.len() > 50;
-        entities.truncate(50);
-        let next_after = entities
-            .last()
-            .map(|entry| entry.id.clone())
-            .unwrap_or_default();
-        let mut items = Vec::new();
-        for entry in entities {
-            let crate::journal::RecordEntry {
-                id,
-                entity,
-                conflict,
-            } = entry;
-            let record = self.read_record(&key, &entity.body)?;
-            let conflict = conflict
-                .map(|body| {
-                    let operation = codec::versioned(&body)?;
-                    let record = self.read_record(&key, &body)?;
+        self.protected_read(async {
+            let key = self.key().await?.ok_or(Error::Locked)?;
+            let (mut entities, observed_seq, local_revision) =
+                self.journal.record_page(after).await?;
+            let has_more = entities.len() > 50;
+            entities.truncate(50);
+            let next_after = entities
+                .last()
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default();
+            let mut items = Vec::new();
+            for entry in entities {
+                let crate::journal::RecordEntry {
+                    id,
+                    entity,
+                    conflict,
+                } = entry;
+                let record = self.read_record(&key, &entity.body)?;
+                let conflict = conflict
+                    .map(|body| {
+                        let operation = codec::versioned(&body)?;
+                        let record = self.read_record(&key, &body)?;
+                        let (title, username) = record.display();
+                        Ok::<_, Error>(crate::view::ConflictView {
+                            title,
+                            username,
+                            device_id: operation.operation.device.as_str().into(),
+                            deleted: record.deleted(),
+                        })
+                    })
+                    .transpose()?;
+                if !record.deleted() || entity.conflicted {
                     let (title, username) = record.display();
-                    Ok::<_, Error>(crate::view::ConflictView {
+                    items.push(RecordView {
+                        deleted: record.deleted(),
+                        observed_seq,
+                        id,
                         title,
                         username,
-                        device_id: operation.operation.device.as_str().into(),
-                        deleted: record.deleted(),
-                    })
-                })
-                .transpose()?;
-            if !record.deleted() || entity.conflicted {
-                let (title, username) = record.display();
-                items.push(RecordView {
-                    deleted: record.deleted(),
-                    observed_seq,
-                    id,
-                    title,
-                    username,
-                    revision: entity.revision,
-                    pending_id: entity.pending_id,
-                    conflicted: entity.conflicted,
-                    conflict,
-                });
+                        revision: entity.revision,
+                        pending_id: entity.pending_id,
+                        conflicted: entity.conflicted,
+                        conflict,
+                    });
+                }
             }
-        }
-        Ok(RecordPage {
-            observed_seq,
-            local_revision,
-            items,
-            next_after,
-            has_more,
+            Ok(RecordPage {
+                observed_seq,
+                local_revision,
+                items,
+                next_after,
+                has_more,
+            })
         })
+        .await
     }
     fn decode_record(&self, key: &VaultKey, body: &[u8]) -> Result<Record, Error> {
         // Fields for a new explicit action only; retained ciphertext/header are
@@ -1170,43 +1203,41 @@ impl VaultClient {
     ) -> Result<ReadRecord, Error> {
         nddev_device_sync_domain::ModuleId::new(id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
-        let key = self.key().await?.ok_or(Error::Locked)?;
-        let missing_or_deleted = if selection.is_some() {
-            Error::SelectionChanged
-        } else {
-            Error::Invalid
-        };
-        let entity = self
-            .journal
-            .entity("vault_record", id)
-            .await?
-            .ok_or(missing_or_deleted)?;
-        let operation = codec::versioned(&entity.body)?;
-        if entity.conflicted
-            || selection.is_some_and(|selected| {
-                !selected.matches_record(
-                    &operation.operation,
-                    entity.revision,
-                    entity.pending_id.as_deref(),
-                )
-            })
-        {
-            return Err(if selection.is_some() {
+        self.protected_read(async {
+            let key = self.key().await?.ok_or(Error::Locked)?;
+            let missing_or_deleted = if selection.is_some() {
                 Error::SelectionChanged
             } else {
-                Error::Busy
-            });
-        }
-        let record = self.read_record(&key, &entity.body)?;
-        if record.deleted() {
-            return Err(missing_or_deleted);
-        }
-        self.identity
-            .authorize_local()
-            .await
-            .map_err(identity_failure)?;
-        self.authorized()?;
-        Ok(record)
+                Error::Invalid
+            };
+            let entity = self
+                .journal
+                .entity("vault_record", id)
+                .await?
+                .ok_or(missing_or_deleted)?;
+            let operation = codec::versioned(&entity.body)?;
+            if entity.conflicted
+                || selection.is_some_and(|selected| {
+                    !selected.matches_record(
+                        &operation.operation,
+                        entity.revision,
+                        entity.pending_id.as_deref(),
+                    )
+                })
+            {
+                return Err(if selection.is_some() {
+                    Error::SelectionChanged
+                } else {
+                    Error::Busy
+                });
+            }
+            let record = self.read_record(&key, &entity.body)?;
+            if record.deleted() {
+                return Err(missing_or_deleted);
+            }
+            Ok(record)
+        })
+        .await
     }
     pub async fn synchronize(&self) -> Result<VaultView, Error> {
         self.synchronize_batch(false)
@@ -1461,150 +1492,153 @@ impl VaultClient {
     }
     pub async fn states(&self, after: String) -> Result<StatePage, Error> {
         let _permit = self.admitted()?;
-        let key = self.key().await?.ok_or(Error::Locked)?;
-        let cursor = if after.is_empty() {
-            None
-        } else {
-            let (kind, id) = after.split_once(':').ok_or(Error::Invalid)?;
-            if !matches!(kind, "device_state" | "module_state" | "account_state")
-                || nddev_device_sync_domain::ModuleId::new(id).is_err()
-            {
-                return Err(Error::Invalid);
-            }
-            Some((kind.to_owned(), id.to_owned()))
-        };
-        let page = self.journal.state_page(cursor).await?;
-        let mut entries = page.entries;
-        let has_more = entries.len() > 50;
-        entries.truncate(50);
-        let next_after = entries
-            .last()
-            .map(|(kind, id, _)| format!("{kind}:{id}"))
-            .unwrap_or(after);
-        let mut items = Vec::new();
-        for (kind, id, entity) in entries {
-            let envelope = codec::versioned(&entity.body)?;
-            let operation = &envelope.operation;
-            let plaintext = key.decrypt_versioned(&self.scope, &envelope)?;
-            let snapshot: Snapshot = match serde_json::from_slice(&plaintext) {
-                Ok(value) => value,
-                Err(_) => {
-                    // Exact published alpha.1 initialization marker. It asserts
-                    // no observation; a subsequent device publication replaces
-                    // this read model without rewriting encrypted history.
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct Initialization {
-                        schema_version: u16,
-                        device_id: String,
-                    }
-                    let old: Initialization =
-                        serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
-                    if operation.entity_kind != EntityKind::DeviceState
-                        || old.schema_version != 1
-                        || old.device_id != operation.device.as_str()
-                        || operation.entity_id != old.device_id
-                    {
-                        return Err(Error::Invalid);
-                    }
-                    continue;
-                }
-            };
-            snapshot
-                .validate(&operation.device, operation.entity_kind, &id)
-                .map_err(|_| Error::Invalid)?;
-            let mut value = StateView {
-                kind,
-                id,
-                device_id: operation.device.as_str().into(),
-                label: String::new(),
-                version: String::new(),
-                platform: String::new(),
-                reachability: String::new(),
-                configured: false,
-                enabled: None,
-                permissions: Vec::new(),
-                checked_at_ms: 0,
-                observed_at_ms: snapshot.observed_at_ms,
-                expires_at_ms: 0,
-                error_class: String::new(),
-                revision: entity.revision,
-                pending_id: entity.pending_id,
-                conflicted: entity.conflicted,
-            };
-            match snapshot.data {
-                State::Repository { .. }
-                | State::GithubSource { .. }
-                | State::RepositoryConnection { .. } => {
+        self.protected_read(async {
+            let key = self.key().await?.ok_or(Error::Locked)?;
+            let cursor = if after.is_empty() {
+                None
+            } else {
+                let (kind, id) = after.split_once(':').ok_or(Error::Invalid)?;
+                if !matches!(kind, "device_state" | "module_state" | "account_state")
+                    || nddev_device_sync_domain::ModuleId::new(id).is_err()
+                {
                     return Err(Error::Invalid);
                 }
-                State::Device {
-                    display_name,
-                    platform,
-                    client_version,
-                } => {
-                    value.label = display_name;
-                    value.platform = platform;
-                    value.version = client_version;
-                }
-                State::Module {
-                    module_id,
-                    version,
-                    configured,
-                    reachability,
-                    checked_at_ms,
-                    error_class,
-                } => {
-                    value.label = module_id;
-                    value.version = version;
-                    value.configured = configured;
-                    value.reachability = match reachability {
-                        Reachability::NotChecked => "not_checked",
-                        Reachability::Reachable => "reachable",
-                        Reachability::Unavailable => "unavailable",
-                        Reachability::Failed => "failed",
+                Some((kind.to_owned(), id.to_owned()))
+            };
+            let page = self.journal.state_page(cursor).await?;
+            let mut entries = page.entries;
+            let has_more = entries.len() > 50;
+            entries.truncate(50);
+            let next_after = entries
+                .last()
+                .map(|(kind, id, _)| format!("{kind}:{id}"))
+                .unwrap_or(after);
+            let mut items = Vec::new();
+            for (kind, id, entity) in entries {
+                let envelope = codec::versioned(&entity.body)?;
+                let operation = &envelope.operation;
+                let plaintext = key.decrypt_versioned(&self.scope, &envelope)?;
+                let snapshot: Snapshot = match serde_json::from_slice(&plaintext) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        // Exact published alpha.1 initialization marker. It asserts
+                        // no observation; a subsequent device publication replaces
+                        // this read model without rewriting encrypted history.
+                        #[derive(Deserialize)]
+                        #[serde(deny_unknown_fields)]
+                        struct Initialization {
+                            schema_version: u16,
+                            device_id: String,
+                        }
+                        let old: Initialization =
+                            serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+                        if operation.entity_kind != EntityKind::DeviceState
+                            || old.schema_version != 1
+                            || old.device_id != operation.device.as_str()
+                            || operation.entity_id != old.device_id
+                        {
+                            return Err(Error::Invalid);
+                        }
+                        continue;
                     }
-                    .into();
-                    value.checked_at_ms = checked_at_ms.unwrap_or(0);
-                    value.error_class = error_class.unwrap_or_default();
+                };
+                snapshot
+                    .validate(&operation.device, operation.entity_kind, &id)
+                    .map_err(|_| Error::Invalid)?;
+                let mut value = StateView {
+                    kind,
+                    id,
+                    device_id: operation.device.as_str().into(),
+                    label: String::new(),
+                    version: String::new(),
+                    platform: String::new(),
+                    reachability: String::new(),
+                    configured: false,
+                    enabled: None,
+                    permissions: Vec::new(),
+                    checked_at_ms: 0,
+                    observed_at_ms: snapshot.observed_at_ms,
+                    expires_at_ms: 0,
+                    error_class: String::new(),
+                    revision: entity.revision,
+                    pending_id: entity.pending_id,
+                    conflicted: entity.conflicted,
+                };
+                match snapshot.data {
+                    State::Repository { .. }
+                    | State::GithubSource { .. }
+                    | State::RepositoryConnection { .. } => {
+                        return Err(Error::Invalid);
+                    }
+                    State::Device {
+                        display_name,
+                        platform,
+                        client_version,
+                    } => {
+                        value.label = display_name;
+                        value.platform = platform;
+                        value.version = client_version;
+                    }
+                    State::Module {
+                        module_id,
+                        version,
+                        configured,
+                        reachability,
+                        checked_at_ms,
+                        error_class,
+                    } => {
+                        value.label = module_id;
+                        value.version = version;
+                        value.configured = configured;
+                        value.reachability = match reachability {
+                            Reachability::NotChecked => "not_checked",
+                            Reachability::Reachable => "reachable",
+                            Reachability::Unavailable => "unavailable",
+                            Reachability::Failed => "failed",
+                        }
+                        .into();
+                        value.checked_at_ms = checked_at_ms.unwrap_or(0);
+                        value.error_class = error_class.unwrap_or_default();
+                    }
+                    State::ModuleConfiguration {
+                        module_id,
+                        configuration,
+                    } => {
+                        value.kind = "module_configuration".into();
+                        value.label = module_id;
+                        value.enabled = Some(configuration.enabled);
+                        value.permissions = configuration
+                            .permissions
+                            .into_iter()
+                            .map(|permission| {
+                                match serde_json::to_value(permission).map_err(dependency)? {
+                                    serde_json::Value::String(tag) => Ok(tag),
+                                    _ => Err(Error::Invalid),
+                                }
+                            })
+                            .collect::<Result<_, _>>()?;
+                    }
+                    State::Account {
+                        auth_method,
+                        checked_at_ms,
+                        expires_at_ms,
+                    } => {
+                        value.label = auth_method;
+                        value.checked_at_ms = checked_at_ms;
+                        value.expires_at_ms = expires_at_ms;
+                    }
                 }
-                State::ModuleConfiguration {
-                    module_id,
-                    configuration,
-                } => {
-                    value.kind = "module_configuration".into();
-                    value.label = module_id;
-                    value.enabled = Some(configuration.enabled);
-                    value.permissions = configuration
-                        .permissions
-                        .into_iter()
-                        .map(|permission| {
-                            match serde_json::to_value(permission).map_err(dependency)? {
-                                serde_json::Value::String(tag) => Ok(tag),
-                                _ => Err(Error::Invalid),
-                            }
-                        })
-                        .collect::<Result<_, _>>()?;
-                }
-                State::Account {
-                    auth_method,
-                    checked_at_ms,
-                    expires_at_ms,
-                } => {
-                    value.label = auth_method;
-                    value.checked_at_ms = checked_at_ms;
-                    value.expires_at_ms = expires_at_ms;
-                }
+                items.push(value);
             }
-            items.push(value);
-        }
-        Ok(StatePage {
-            observed_seq: page.cursor,
-            local_revision: page.local_revision,
-            items,
-            next_after,
-            has_more,
+            Ok(StatePage {
+                observed_seq: page.cursor,
+                local_revision: page.local_revision,
+                items,
+                next_after,
+                has_more,
+            })
         })
+        .await
     }
     async fn synchronize_inner(&self) -> Result<VaultView, Error> {
         self.reconcile_inner(false)
@@ -2815,3 +2849,7 @@ mod workspace_acceptance;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "ownership_acceptance.rs"]
 mod ownership_acceptance;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "local_read_acceptance.rs"]
+mod local_read_acceptance;

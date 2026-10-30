@@ -18,6 +18,10 @@ legacy-schema-one-acceptance:
 replica-admission-acceptance:
     cargo test --locked --features development-http --lib actual_native_replica_admission_preserves_pending_and_local_reads -- --ignored
 
+# Joined actual local reads, original lifetime denial and same-owner renewal.
+local-read-acceptance:
+    RUST_MIN_STACK=8388608 cargo test --locked --features development-http --lib client::local_read_acceptance::actual_local_read_publication_retains_original_lifetime -- --ignored --exact --test-threads=1
+
 replica-owner-acceptance:
     cargo test --locked --features development-http --lib actual_native_owner_has_fresh_followers_and_hands_off -- --ignored
 
