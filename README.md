@@ -39,6 +39,12 @@ renew offline authority or hide pending/Unknown work. After the owner stops,
 an existing follower may acquire ownership through the same OS lock. Actual
 native workers retain both leases until completion.
 
+Record/state pages, clipboard reads (including an empty result) and native
+credential reads capture the original Accounts fence before key and journal
+I/O. Successful data is returned only after that same fence and original Vault
+scope pass their final checks. A new same-owner authorization cannot admit an
+older pending read; a new explicit read can use the renewed authority.
+
 On Linux, macOS and Windows, `NativeReplica` retains one selected account's
 Rust identity, Vault, task, scheduling policy and telemetry delivery across
 presentation attachments. Its identity has an independent cancellation lifetime;
@@ -115,6 +121,13 @@ publication receipt, so later metadata cannot relabel an earlier result.
 NDS permission consent does not grant OS/browser access or prove provider readiness.
 
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. That recipe gives the large debug acceptance future an explicit 8 MiB test-thread stack; application thread stacks and resource limits are unchanged. Host checks do not prove another platform's secure-store or UI behavior.
+
+`just local-read-acceptance` uses a fresh `--fixture-sync3` fixture and isolated
+native credentials. It holds actual local-read replies after SQLite completion,
+renews the same owner's authority and checks refusal of the old lifetime, new
+explicit reads, unchanged encrypted rows and caller-drop permit release. Its
+inert hold port is native-test-only and adds no serialized command or production
+worker state.
 
 The native lifecycle acceptance migrates an isolated schema2 fixture with its
 retained sequences and actual committed ciphertext. General schema1 replay of

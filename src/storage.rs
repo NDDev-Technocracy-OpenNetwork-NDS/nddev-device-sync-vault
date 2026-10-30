@@ -587,6 +587,16 @@ pub(crate) struct Storage {
     scope: String,
     io: Arc<Semaphore>,
     admission: Arc<Semaphore>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    read_reply_hold: std::sync::Mutex<Option<ReadReplyHold>>,
+}
+/// Inert, per-storage test port after the actual native transaction has joined.
+/// It changes no serialized command, worker behavior or production admission.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+struct ReadReplyHold {
+    selected: fn(&Command) -> bool,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ReplicaLease {
@@ -606,6 +616,8 @@ impl Storage {
                 owner: Default::default(),
                 io: Arc::new(Semaphore::new(1)),
                 admission: Arc::new(Semaphore::new(4)),
+                #[cfg(test)]
+                read_reply_hold: Default::default(),
             })
         }
         #[cfg(target_arch = "wasm32")]
@@ -625,6 +637,25 @@ impl Storage {
     }
     pub(crate) async fn call(&self, command: Command) -> Result<Reply, Error> {
         self.call_guarded(command, || Ok(())).await
+    }
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn hold_read_reply(
+        &self,
+        selected: fn(&Command) -> bool,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut slot = self.read_reply_hold.lock().unwrap();
+        assert!(slot.is_none(), "one retained read reply per test storage");
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        *slot = Some(ReadReplyHold {
+            selected,
+            entered,
+            release: held,
+        });
+        (observed, release)
     }
     /// Synchronous caller guard after admission, before any transaction starts.
     /// It is not serialized to the worker and must perform no I/O.
@@ -660,6 +691,15 @@ impl Storage {
             .map_err(|_| Error::Unavailable)?;
         #[cfg(not(target_arch = "wasm32"))]
         {
+            #[cfg(test)]
+            let hold = {
+                let mut slot = self.read_reply_hold.lock().unwrap();
+                if slot.as_ref().is_some_and(|hold| (hold.selected)(&command)) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
             let journal = self.journal.clone();
             // Aborting the waiting async batch cannot abort spawn_blocking.
             // Retain its exact scope lease until this worker really returns.
@@ -668,7 +708,7 @@ impl Storage {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .upgrade();
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 // Close the scope lease before releasing the I/O drain barrier.
                 let _permits = (replica, permit, admission);
                 span.in_scope(|| {
@@ -678,7 +718,19 @@ impl Storage {
                 })
             })
             .await
-            .map_err(|_| Error::Unavailable)?
+            .map_err(|_| Error::Unavailable)?;
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                hold.entered.send(()).map_err(|_| Error::Unavailable)?;
+                nddev_device_sync_accounts::runtime::timeout(
+                    std::time::Duration::from_secs(10),
+                    hold.release,
+                )
+                .await
+                .map_err(|_| Error::Unavailable)?
+                .map_err(|_| Error::Unavailable)?;
+            }
+            result
         }
         #[cfg(target_arch = "wasm32")]
         {
