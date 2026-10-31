@@ -122,7 +122,7 @@ impl VaultClient {
         location.validate().map_err(|_| Error::Invalid)?;
         self.validate_repository_read_inner(read).await?;
         let context = read.source.binding.as_ref().ok_or(Error::Invalid)?;
-        if context.module_id != self.module_configuration_id("gds")? {
+        if context.module_id != self.module_configuration_id("github")? {
             return Err(Error::Invalid);
         }
         let key = self.key().await?.ok_or(Error::Locked)?;

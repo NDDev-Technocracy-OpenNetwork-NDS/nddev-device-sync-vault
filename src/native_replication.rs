@@ -159,8 +159,8 @@ impl NativeReplica {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
-    /// One typed GDS resource for this retained identity/Vault pair. The factory
-    /// is supplied by the assembly; Vault has no dependency on the GDS adapter.
+    /// One typed GitHub-module resource for this retained identity/Vault pair. The
+    /// factory is supplied by the assembly; Vault has no dependency on that adapter.
     pub fn catalog<T: CatalogCollector>(
         &self,
         create: impl FnOnce(Arc<IdentityClient>, Arc<VaultClient>) -> T,
