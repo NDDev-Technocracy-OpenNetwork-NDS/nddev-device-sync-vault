@@ -69,7 +69,7 @@ async fn exercise(identity: Arc<IdentityClient>, directory: PathBuf) -> Result<(
     required.remove(&Permission::GitWrite);
     vault
         .set_module_configuration(
-            "gds".into(),
+            "github".into(),
             0,
             None,
             Configuration {
@@ -119,10 +119,10 @@ async fn exercise(identity: Arc<IdentityClient>, directory: PathBuf) -> Result<(
             .await,
         Err(Error::Invalid)
     ));
-    let setting = vault.module_configuration("gds").await?;
+    let setting = vault.module_configuration("github").await?;
     vault
         .set_module_configuration(
-            "gds".into(),
+            "github".into(),
             setting.revision,
             setting.pending_id,
             Configuration {
@@ -187,10 +187,10 @@ async fn exercise(identity: Arc<IdentityClient>, directory: PathBuf) -> Result<(
             .observations
             .is_empty()
     );
-    let setting = vault.module_configuration("gds").await?;
+    let setting = vault.module_configuration("github").await?;
     vault
         .set_module_configuration(
-            "gds".into(),
+            "github".into(),
             setting.revision,
             setting.pending_id,
             Configuration {

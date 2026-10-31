@@ -18,12 +18,12 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             .await
             .map_err(dependency)?
             .ok_or(Error::Locked)?;
-        let initial = vault.module_configuration("gds").await?;
+        let initial = vault.module_configuration("github").await?;
         assert!(
             !initial.configuration.enabled && initial.revision == 0 && initial.pending_id.is_none()
         );
         assert!(matches!(
-            vault.module_configuration("other:gds").await,
+            vault.module_configuration("other:github").await,
             Err(Error::Invalid)
         ));
         let enabled = Configuration {
@@ -31,15 +31,15 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             permissions: BTreeSet::from([Permission::ReadOnly]),
         };
         let operation = vault
-            .set_module_configuration("gds".into(), 0, None, enabled.clone())
+            .set_module_configuration("github".into(), 0, None, enabled.clone())
             .await?;
-        let pending = vault.module_configuration("gds").await?;
+        let pending = vault.module_configuration("github").await?;
         assert_eq!(pending.configuration, enabled);
         assert_eq!(pending.operation_id.as_deref(), Some(operation.as_str()));
         assert_eq!(pending.pending_id.as_deref(), Some(operation.as_str()));
         assert!(matches!(
             vault
-                .set_module_configuration("gds".into(), 0, None, Configuration::default())
+                .set_module_configuration("github".into(), 0, None, Configuration::default())
                 .await,
             Err(Error::Busy)
         ));
@@ -47,7 +47,7 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             schema_version: 2,
             observed_at_ms: now_ms()?,
             data: State::ModuleConfiguration {
-                module_id: "gds".into(),
+                module_id: "github".into(),
                 configuration: Configuration::default(),
             },
         };
@@ -59,7 +59,7 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             schema_version: 1,
             observed_at_ms: now_ms()?,
             data: State::Module {
-                module_id: "gds".into(),
+                module_id: "github".into(),
                 version: "1".into(),
                 configured: true,
                 reachability: Reachability::NotChecked,
@@ -68,16 +68,30 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             },
         };
         vault.publish_states(vec![observation]).await?;
-        let mut committed = vault.module_configuration("gds").await?;
+        let mut committed = vault.module_configuration("github").await?;
         for _ in 0..4 {
             if committed.pending_id.is_none() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             vault.synchronize().await?;
-            committed = vault.module_configuration("gds").await?;
+            committed = vault.module_configuration("github").await?;
         }
         assert_eq!(committed.configuration, enabled);
+        // The retired name addresses the same retained record and revision.
+        let legacy = vault.module_configuration("gds").await?;
+        assert_eq!(legacy.configuration, enabled);
+        assert_eq!(legacy.revision, committed.revision);
+        assert!(
+            vault
+                .journal
+                .entity(
+                    "module_state",
+                    &format!("{}:gds:configuration", vault.scope.device)
+                )
+                .await?
+                .is_some()
+        );
         assert_eq!(committed.operation_id, pending.operation_id);
         assert!(committed.local_revision >= pending.local_revision);
         assert!(
@@ -104,7 +118,7 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
         assert!(identity.view().offline_authorized);
         let mutation = vault
             .set_module_configuration_attempt(
-                "gds".into(),
+                "github".into(),
                 committed.revision,
                 None,
                 Configuration::default(),
@@ -113,7 +127,7 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
         let operation = mutation.operation_id;
 
         let reopened = VaultClient::new(identity.clone(), directory.clone()).await?;
-        let retained = reopened.module_configuration("gds").await?;
+        let retained = reopened.module_configuration("github").await?;
         assert_eq!(retained.configuration, Configuration::default());
         assert_eq!(retained.pending_id.as_deref(), Some(operation.as_str()));
         assert_eq!(retained.operation_id.as_deref(), Some(operation.as_str()));
@@ -122,7 +136,7 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
         assert!(retained.local_revision > committed.local_revision);
         assert!(matches!(
             vault
-                .set_module_configuration("gds".into(), committed.revision, None, enabled)
+                .set_module_configuration("github".into(), committed.revision, None, enabled)
                 .await,
             Err(Error::Busy)
         ));
@@ -138,7 +152,7 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
             .await
             .map_err(dependency)?;
         reopened.synchronize().await?;
-        let settled = reopened.module_configuration("gds").await?;
+        let settled = reopened.module_configuration("github").await?;
         assert_eq!(settled.configuration, Configuration::default());
         assert!(settled.pending_id.is_none() && settled.revision == 2 && !settled.conflicted);
         assert_eq!(settled.operation_id, retained.operation_id);
@@ -146,19 +160,19 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
         // the original authorization captured before the explicit withdrawal.
         let restored = reopened
             .set_module_configuration(
-                "gds".into(),
+                "github".into(),
                 settled.revision,
                 None,
                 pending.configuration.clone(),
             )
             .await?;
-        let renewed = reopened.module_configuration("gds").await?;
+        let renewed = reopened.module_configuration("github").await?;
         assert_eq!(renewed.configuration, committed.configuration);
         assert_eq!(renewed.operation_id.as_deref(), Some(restored.as_str()));
         assert_ne!(renewed.operation_id, committed.operation_id);
         identity.logout().await.map_err(dependency)?;
         assert!(matches!(
-            reopened.module_configuration("gds").await,
+            reopened.module_configuration("github").await,
             Err(Error::Locked)
         ));
         Ok::<_, Error>(())

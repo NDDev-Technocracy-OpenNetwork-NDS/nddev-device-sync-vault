@@ -1443,7 +1443,11 @@ impl VaultClient {
         let writer = DeviceId::new(self.scope.device.clone()).map_err(dependency)?;
         let mut targets = std::collections::BTreeSet::new();
         let mut prepared = Vec::new();
-        for snapshot in snapshots {
+        for mut snapshot in snapshots {
+            // Observations of renamed modules stay on their original record.
+            if let State::Module { module_id, .. } = &mut snapshot.data {
+                *module_id = nddev_device_sync_domain::modules::storage_id(module_id).to_owned();
+            }
             let (kind, id) = match &snapshot.data {
                 State::Repository { .. }
                 | State::GithubSource { .. }
@@ -1587,7 +1591,8 @@ impl VaultClient {
                         checked_at_ms,
                         error_class,
                     } => {
-                        value.label = module_id;
+                        value.label =
+                            nddev_device_sync_domain::modules::module_id(&module_id).to_owned();
                         value.version = version;
                         value.configured = configured;
                         value.reachability = match reachability {
@@ -1605,7 +1610,8 @@ impl VaultClient {
                         configuration,
                     } => {
                         value.kind = "module_configuration".into();
-                        value.label = module_id;
+                        value.label =
+                            nddev_device_sync_domain::modules::module_id(&module_id).to_owned();
                         value.enabled = Some(configuration.enabled);
                         value.permissions = configuration
                             .permissions

@@ -32,7 +32,7 @@ impl VaultClient {
             return Err(Error::Cancelled);
         }
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let module_id = self.module_configuration_id("gds")?;
+        let module_id = self.module_configuration_id("github")?;
         let (source, module) = match self
             .journal
             .call(crate::storage::Command::CatalogContext {
@@ -309,7 +309,7 @@ mod tests {
             let enabled = nddev_device_sync_domain::modules::control::Configuration {
                 enabled: true, permissions: required.clone(),
             };
-            vault.set_module_configuration("gds".into(), 0, None, enabled.clone()).await?;
+            vault.set_module_configuration("github".into(), 0, None, enabled.clone()).await?;
             assert!(matches!(vault.capture_configured_repository_observations(&required, "obsolete-source-operation", fence.clone(), cancellation.clone()).await, Err(Error::SelectionChanged)));
             let configured = vault.capture_configured_repository_observations(&required, &receipt.operation_id, fence, cancellation).await?;
             assert_eq!(configured.selection(), &selected);
@@ -336,9 +336,9 @@ mod tests {
             caller.cancel();
             assert!(matches!(vault.validate_repository_read(&delegated).await, Err(Error::Locked)));
             vault.validate_repository_read(&configured).await?;
-            let disabled = vault.set_module_configuration("gds".into(), 1, None, Default::default()).await?;
+            let disabled = vault.set_module_configuration("github".into(), 1, None, Default::default()).await?;
             assert!(matches!(vault.validate_repository_read(&configured).await, Err(Error::SelectionChanged)));
-            vault.set_module_configuration("gds".into(), 1, Some(disabled), enabled).await?;
+            vault.set_module_configuration("github".into(), 1, Some(disabled), enabled).await?;
             // Re-enabling cannot resurrect a read from an earlier consent edit.
             assert!(matches!(vault.validate_repository_read(&configured).await, Err(Error::SelectionChanged)));
             assert_eq!(
