@@ -1,6 +1,6 @@
 //! Writer-scoped encrypted module intent through the existing journal.
 use super::*;
-use nddev_device_sync_domain::modules::control::Configuration as ModuleConfiguration;
+use nddev_device_sync_domain::modules::{control::Configuration as ModuleConfiguration, storage_id};
 
 /// Rust-only configuration witness. No credentials or provider data are exposed.
 #[derive(Clone, Default)]
@@ -21,12 +21,14 @@ pub struct ModuleMutation {
 }
 
 impl VaultClient {
+    /// Renamed modules keep their original storage key, so a retained setting,
+    /// its revision and consent are the same record under either name.
     pub(super) fn module_configuration_id(&self, module: &str) -> Result<String, Error> {
         nddev_device_sync_domain::ModuleId::new(module).map_err(|_| Error::Invalid)?;
         if module.contains(':') {
             return Err(Error::Invalid);
         }
-        Ok(format!("{}:{module}:configuration", self.scope.device))
+        Ok(format!("{}:{}:configuration", self.scope.device, storage_id(module)))
     }
 
     /// Only this installation's desired state may authorize its operations.
@@ -107,7 +109,7 @@ impl VaultClient {
             schema_version: 2,
             observed_at_ms: now_ms()?,
             data: State::ModuleConfiguration {
-                module_id: module,
+                module_id: storage_id(&module).to_owned(),
                 configuration,
             },
         };

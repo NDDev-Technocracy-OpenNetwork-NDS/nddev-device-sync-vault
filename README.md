@@ -114,6 +114,9 @@ revision/pending/conflict evidence; `set_module_configuration` uses the same
 revision and pending-ID compare-and-swap as record edits. It acknowledges local
 durability and works under valid offline authority; ordinary reconciliation
 commits it later. Automatic observation publication cannot change configuration.
+The renamed `github` and `remote` modules keep their original storage keys
+(`gds`, `rds`): their retained settings, revisions and consent are the same
+records under either name, and older clients keep sharing them.
 The original operation identity survives acknowledgement and changes on a new
 choice, including identical reapproval after withdrawal. Reads bind that identity
 to the local revision in one transaction; mutation attempts return the frozen
