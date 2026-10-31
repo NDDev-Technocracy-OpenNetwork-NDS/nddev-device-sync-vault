@@ -1,6 +1,8 @@
 //! Writer-scoped encrypted module intent through the existing journal.
 use super::*;
-use nddev_device_sync_domain::modules::{control::Configuration as ModuleConfiguration, storage_id};
+use nddev_device_sync_domain::modules::{
+    control::Configuration as ModuleConfiguration, storage_id,
+};
 
 /// Rust-only configuration witness. No credentials or provider data are exposed.
 #[derive(Clone, Default)]
@@ -28,7 +30,11 @@ impl VaultClient {
         if module.contains(':') {
             return Err(Error::Invalid);
         }
-        Ok(format!("{}:{}:configuration", self.scope.device, storage_id(module)))
+        Ok(format!(
+            "{}:{}:configuration",
+            self.scope.device,
+            storage_id(module)
+        ))
     }
 
     /// Only this installation's desired state may authorize its operations.

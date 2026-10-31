@@ -85,7 +85,10 @@ async fn actual_module_configuration_preserves_consent_offline_and_rejects_stale
         assert!(
             vault
                 .journal
-                .entity("module_state", &format!("{}:gds:configuration", vault.scope.device))
+                .entity(
+                    "module_state",
+                    &format!("{}:gds:configuration", vault.scope.device)
+                )
                 .await?
                 .is_some()
         );

@@ -1591,7 +1591,8 @@ impl VaultClient {
                         checked_at_ms,
                         error_class,
                     } => {
-                        value.label = nddev_device_sync_domain::modules::module_id(&module_id).to_owned();
+                        value.label =
+                            nddev_device_sync_domain::modules::module_id(&module_id).to_owned();
                         value.version = version;
                         value.configured = configured;
                         value.reachability = match reachability {
@@ -1609,7 +1610,8 @@ impl VaultClient {
                         configuration,
                     } => {
                         value.kind = "module_configuration".into();
-                        value.label = nddev_device_sync_domain::modules::module_id(&module_id).to_owned();
+                        value.label =
+                            nddev_device_sync_domain::modules::module_id(&module_id).to_owned();
                         value.enabled = Some(configuration.enabled);
                         value.permissions = configuration
                             .permissions

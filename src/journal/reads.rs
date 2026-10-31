@@ -57,7 +57,10 @@ pub(super) fn catalog_binding_current(
 ) -> Result<(), Error> {
     use nddev_device_sync_domain::repositories::catalog::SOURCE_ENTITY_ID;
     let stored = nddev_device_sync_domain::modules::storage_id("github");
-    if !binding.module_id.ends_with(&format!(":{stored}:configuration")) {
+    if !binding
+        .module_id
+        .ends_with(&format!(":{stored}:configuration"))
+    {
         return Err(Error::Invalid);
     }
     for (kind, id, expected) in [
