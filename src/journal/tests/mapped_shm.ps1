@@ -12,7 +12,8 @@ try {
         [System.IO.FileAccess]::ReadWrite, $sharing)
     $stage = 'map'
     $mapping = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile(
-        $stream, $null, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite,
+        $stream, [System.Management.Automation.Language.NullString]::Value, 0,
+        [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite,
         [System.IO.HandleInheritability]::None, $true)
     $stage = 'view'
     $view = $mapping.CreateViewAccessor(0, 0,

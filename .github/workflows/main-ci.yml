@@ -71,4 +71,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Qualify native Windows mapped-SHM journal opening
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --lib journal::tests::windows::mapped_shm_allows_existing_wal_journal_reads_on_windows -- --exact
       - run: cargo test --locked --all-features
