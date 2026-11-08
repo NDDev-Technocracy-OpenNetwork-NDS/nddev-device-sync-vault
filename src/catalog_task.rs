@@ -119,18 +119,21 @@ mod tests {
     }
     #[tokio::test]
     async fn completed_io_continues_without_replica_ticks_and_a_finished_round_stays_idle() {
+        // Provision the real database, lease and sockets before timing the
+        // completion-driven collection behavior. Synchronous filesystem setup
+        // cannot be preempted by Tokio's timeout and is not a collection tick.
+        let directory =
+            std::env::temp_dir().join(format!("nds-collection-wake-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let journal = crate::journal::Journal::open(directory.join("vault.sqlite")).unwrap();
+        let owner = Arc::new(journal.owner_lock().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let collector = Arc::new(FiniteCollection(tokio::sync::Mutex::new(stream)));
         tokio::time::timeout(Duration::from_secs(2), async {
-            let directory =
-                std::env::temp_dir().join(format!("nds-collection-wake-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&directory).unwrap();
-            let journal = crate::journal::Journal::open(directory.join("vault.sqlite")).unwrap();
-            let owner = Arc::new(journal.owner_lock().unwrap());
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let stream = TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
-            let (mut peer, _) = listener.accept().await.unwrap();
-            let collector = Arc::new(FiniteCollection(tokio::sync::Mutex::new(stream)));
             let mut slot = CollectionSlot::default();
             let ready = slot.notification();
             slot.advance(collector.clone(), owner.clone());
@@ -157,10 +160,10 @@ mod tests {
             assert!(slot.work.is_none());
             drop(owner);
             drop(journal.owner_lock().unwrap());
-            std::fs::remove_dir_all(directory).unwrap();
         })
         .await
         .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
     struct SlowCollection {
         stream: tokio::sync::Mutex<TcpStream>,
