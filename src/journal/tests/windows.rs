@@ -90,7 +90,7 @@ async fn mapped_shm_allows_existing_wal_journal_reads_on_windows() {
     }
     assert!(
         status.is_some_and(|status| status.success()),
-        "mapping holder did not exit cleanly"
+        "mapping holder did not exit cleanly; probe={observed:?}"
     );
     assert_eq!(observed, Ok(()));
 }
