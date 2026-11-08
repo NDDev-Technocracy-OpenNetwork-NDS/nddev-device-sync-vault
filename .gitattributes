@@ -1,6 +1,5 @@
 * text=auto eol=lf
 
-.nds/generated.json linguist-generated
 CLAUDE.md linguist-generated
 
 src/browser_journal.js linguist-generated=true
