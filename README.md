@@ -123,7 +123,10 @@ to the local revision in one transaction; mutation attempts return the frozen
 publication receipt, so later metadata cannot relabel an earlier result.
 NDS permission consent does not grant OS/browser access or prove provider readiness.
 
-Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. That recipe gives the large debug acceptance future an explicit 8 MiB test-thread stack; application thread stacks and resource limits are unchanged. Host checks do not prove another platform's secure-store or UI behavior.
+Run `just setup` to prepare frozen browser dependencies, then `just check` for source-only
+formatting, strict browser types, generated output, license/source and unused-dependency checks.
+`just test` runs native tests, Clippy and the advisory audit on an execution host.
+The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. That recipe gives the large debug acceptance future an explicit 8 MiB test-thread stack; application thread stacks and resource limits are unchanged. Host checks do not prove another platform's secure-store or UI behavior.
 
 `just local-read-acceptance` uses a fresh `--fixture-sync3` fixture and isolated
 native credentials. It holds actual local-read replies after SQLite completion,

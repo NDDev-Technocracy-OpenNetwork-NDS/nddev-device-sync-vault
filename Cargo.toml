@@ -20,11 +20,11 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "98f8a98cd6d9c2e679a5cc566de9a4128dbb34f6" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "55291f01682fdba5802653225708cac815f04edb" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
 nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "ad614122d5916accbe1cca198768968b8c5bad0e" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "3bd0c8d4d8b9ad29816ef24b22f1451f1a0f3adc" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "d9e6514c792ba1d96d5e6674b952ad7403c2fc3b" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -49,8 +49,8 @@ rusqlite = { version="=0.40.2",default-features=false,features=["ffi-sqlite-wasm
 # rsqlite-vfs 0.2 callbacks. Upgrade this pair with a compatible rusqlite release.
 sqlite-wasm-rs = "=0.5.5"
 sqlite-wasm-vfs = "=0.2.0"
-wasm-bindgen = "=0.2.129"
-wasm-bindgen-futures = "=0.4.79"
-js-sys = "=0.3.106"
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "=0.4.80"
+js-sys = "=0.3.107"
 uuid = { version="1.27",features=["js"] }
 ring = { version="0.17",features=["wasm32_unknown_unknown_js"] }

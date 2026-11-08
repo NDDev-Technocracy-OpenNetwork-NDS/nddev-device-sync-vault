@@ -1,11 +1,20 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+setup:
+    bun install --frozen-lockfile --ignore-scripts
+
+# Source-only checks; setup prepares dependencies separately.
 check: browser-check
     cargo fmt --check
-    cargo test --locked --all-features --jobs 4
+    cargo deny --locked check licenses sources
+    cargo shear --locked --deny-warnings
+
+# Execution host or runner only. Backend acceptance uses the recipes below.
+test:
+    cargo nextest run --locked --all-features --jobs 4
+    cargo test --locked --all-features --doc --jobs 4
     cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
     cargo audit --deny warnings
-    cargo deny --locked check licenses sources
 
 # The large debug acceptance future needs a bounded test-runner thread stack.
 # This does not change application/runtime thread stacks or process limits.
@@ -56,6 +65,5 @@ wasm-check:
     cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown --jobs 4 -- -D warnings
 
 browser-check:
-    bun install --frozen-lockfile --ignore-scripts
     bun run check
     bun run check:generated
