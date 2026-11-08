@@ -38,7 +38,23 @@ async function run(argv: string[], cwd: string, seconds = 120): Promise<string> 
   };
   try {
     const [text, status] = await Promise.all([captured(), child.exited]);
-    if (status !== 0) throw new Error(`Fixture command failed: ${argv[0]}`);
+    if (status !== 0) {
+      // Cargo JSON carries the actual diagnostic on stdout, not stderr.
+      // Preserve it when collecting artifact paths instead of losing the cause.
+      if (argv.includes("--message-format=json")) {
+        for (const line of text.split("\n")) {
+          const message: unknown = JSON.parse(line);
+          if (
+            object(message) &&
+            message.reason === "compiler-message" &&
+            object(message.message) &&
+            typeof message.message.rendered === "string"
+          )
+            console.error(message.message.rendered);
+        }
+      }
+      throw new Error(`Fixture command failed: ${argv[0]}`);
+    }
     return text.trim();
   } catch (error) {
     stop();

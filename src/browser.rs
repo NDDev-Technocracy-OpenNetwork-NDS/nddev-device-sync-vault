@@ -99,11 +99,10 @@ pub async fn worker_open(scope: String) -> Result<(), Error> {
         return Err(Error::Invalid);
     }
     std::panic::set_hook(Box::new(|_| {}));
-    let cfg = sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg {
-        directory: format!("/nds-replica/{scope}"),
-        initial_capacity: 4,
-        ..Default::default()
-    };
+    let cfg = sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfgBuilder::new()
+        .directory(&format!("/nds-replica/{scope}"))
+        .initial_capacity(4)
+        .build();
     let pool = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(&cfg, true)
         .await
         .map_err(|_| Error::Unavailable)?;

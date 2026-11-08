@@ -1,10 +1,8 @@
 //! Test composition of the actual journal worker API, with opaque owned rows.
 //! It qualifies storage/lifecycle, not authentication or ciphertext validity.
 #![cfg(target_arch = "wasm32")]
-use nddev_device_sync_domain::{
-    DeviceId,
-    sync::{EncryptedPayload, EntityKind, Operation},
-};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use nddev_device_sync_accounts::sync_wire as wire;
 use nddev_device_sync_vault::browser;
 use wasm_bindgen::prelude::*;
 
@@ -33,17 +31,20 @@ pub fn nds_journal_pause() -> Result<(), JsValue> {
 pub fn fixture_originals() -> Result<String, JsValue> {
     let mut rows = Vec::new();
     for number in 1..=3_u8 {
-        let operation = Operation {
-            id: format!("fixture-original-{number}"),
-            device: DeviceId::new("fixture-device").map_err(|_| JsValue::from_str("fixture_id"))?,
-            entity_kind: EntityKind::VaultRecord,
+        // Use the generated wire shape accepted by the real storage command.
+        let operation = wire::SyncOperation {
+            schema_version: 2,
+            operation_id: format!("fixture-original-{number}"),
+            device_id: "fixture-device".into(),
+            entity_type: wire::EntityType::VaultRecord,
             entity_id: format!("fixture-record-{number}"),
             base_revision: 0,
             idempotency_key: format!("fixture-original-{number}"),
-            payload: EncryptedPayload {
+            payload: wire::EncryptedPayload {
+                algorithm: wire::Algorithm::Aes256Gcm,
                 key_id: "11111111-1111-4111-8111-111111111111".into(),
-                nonce: [number; 12],
-                ciphertext: vec![number; 32],
+                nonce: URL_SAFE_NO_PAD.encode([number; 12]),
+                ciphertext: URL_SAFE_NO_PAD.encode([number; 32]),
             },
         };
         rows.push(serde_json::to_vec(&operation).map_err(|_| JsValue::from_str("fixture_body"))?);
