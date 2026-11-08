@@ -11,6 +11,7 @@ check: browser-check
 
 # Execution host or runner only. Backend acceptance uses the recipes below.
 test:
+    bun test ./src
     cargo nextest run --locked --all-features --jobs 4
     cargo test --locked --all-features --doc --jobs 4
     cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
@@ -67,3 +68,8 @@ wasm-check:
 browser-check:
     bun run check
     bun run check:generated
+
+# Execution host only; install the pinned Playwright browsers before this recipe.
+browser-store:
+    bun run build:browser-store
+    bun run test:browser-store

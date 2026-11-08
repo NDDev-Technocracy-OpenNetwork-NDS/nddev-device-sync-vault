@@ -199,6 +199,25 @@ command/result strings. `just browser-check` checks strict DOM/worker types,
 Biome and reproducible JS output using the frozen Bun lockfile; OPFS runtime
 acceptance remains a separate gate.
 
+`just browser-store` runs the actual Rust journal and unchanged generated worker
+in Chromium, Firefox and WebKit on an execution host. Install the locked browser
+engines first with `bunx --bun playwright install --with-deps chromium firefox webkit`.
+The fixture builds the retained VFS source in `scripts/browser-store/baseline.json`
+and the candidate with the same thin example composition. It uses a fresh browser
+profile, loopback port selected by the OS and random owned OPFS directory. It
+checks exact opaque operation bytes, dispatched state and metadata through
+retained/candidate/retained/candidate reopen, malformed-input refusal and two
+independent workers. It uses no account or credential service. The opaque rows
+exercise storage, not authenticated ciphertext validation. This is an unchanged
+schema/VFS transition; it does not qualify application or journal downgrades.
+
+The CI fixture contains a source receipt and complete asset size/digest manifest.
+`bun run serve:browser-store -- <artifact-directory>` serves a verified artifact
+for interactive browser inspection on an execution host without rebuilding it.
+The server binds only to loopback, prints its selected URL and stops on SIGINT or
+SIGTERM. It serves no other files or external requests. No fixture is built or
+run by `just check`; normal Bun unit tests remain scoped to `src/`.
+
 New unsent
 edits are visible locally and may be replaced only using the displayed
 `pending_id` together with the committed revision. Once claimed for transport,

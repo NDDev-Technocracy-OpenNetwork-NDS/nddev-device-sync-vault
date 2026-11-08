@@ -34,7 +34,7 @@ base16ct = { version = "1.0", features = ["alloc"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 time = {version="0.3",features=["parsing"]}
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "process", "io-util"] }
@@ -53,3 +53,9 @@ wasm-bindgen-futures = "=0.4.80"
 js-sys = "=0.3.107"
 uuid = { version="1.27",features=["js"] }
 ring = { version="0.17",features=["wasm32_unknown_unknown_js"] }
+
+[[example]]
+name = "browser-journal"
+path = "examples/browser-journal.rs"
+crate-type = ["cdylib"]
+required-features = ["browser-bindings"]

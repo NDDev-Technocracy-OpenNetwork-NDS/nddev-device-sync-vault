@@ -1,9 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
   "files": {
-    "includes": [
-      "src/*.ts"
-    ]
+    "includes": ["src/*.ts", "scripts/browser-store/**", "playwright.config.ts"]
   },
   "formatter": {
     "indentStyle": "space",

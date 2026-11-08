@@ -4,3 +4,4 @@
 *.db-shm
 /node_modules/
 .nddev-reports/
+/test-results/

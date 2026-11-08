@@ -55,6 +55,45 @@ jobs:
       - name: Run the RustSec advisory audit
         run: cargo audit --deny warnings
 
+  browser-store:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned browser Rust target
+        run: rustup toolchain install 1.99.1 --profile minimal --target wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run check
+      - name: Build the actual retained and candidate journal workers
+        id: fixture
+        run: bun run build:browser-store
+      - name: Install the locked browser engines
+        run: bunx --bun playwright install --with-deps chromium firefox webkit
+      - name: Qualify actual OPFS retention in all three engines
+        run: bun run test:browser-store
+      - name: Retain the source-qualified fixture for browser inspection
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: browser-store-${{ github.sha }}
+          path: .nddev-reports/browser-store/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain the complete browser result
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: browser-store-results-${{ github.sha }}
+          path: .nddev-reports/browser-store-results.xml
+          if-no-files-found: warn
+          retention-days: 7
+
   matrix:
     strategy:
       fail-fast: false
