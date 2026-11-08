@@ -161,6 +161,19 @@ fn failed<E>(_: E) -> Error {
     Error::Unavailable
 }
 fn sql_failed(error: rusqlite::Error) -> Error {
+    // Fixture diagnostics must never include SQL, bound values, paths or error text.
+    // Preserve native result identity so a failed concurrency case is actionable.
+    #[cfg(test)]
+    match &error {
+        rusqlite::Error::SqliteFailure(code, _) => eprintln!(
+            "journal SQLite failure: class={:?}, extended={}",
+            code.code, code.extended_code
+        ),
+        other => eprintln!(
+            "journal SQLite conversion failure: variant={:?}",
+            std::mem::discriminant(other)
+        ),
+    }
     match error {
         rusqlite::Error::SqliteFailure(code, _) => match code.code {
             rusqlite::ErrorCode::DiskFull => Error::StorageFull,

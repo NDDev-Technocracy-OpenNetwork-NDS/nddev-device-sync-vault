@@ -319,8 +319,12 @@ fn concurrent_acknowledgement_and_inbox_settle_one_root_once() {
             barrier.wait();
             inbox_journal.ingest(&incoming, &[0])
         });
-        ack.join().unwrap().unwrap();
-        inbox.join().unwrap().unwrap();
+        // Drain both workers even when one failed. Otherwise an early panic can
+        // delete their owned directory while the other worker still uses it.
+        let ack = ack.join();
+        let inbox = inbox.join();
+        ack.unwrap().unwrap();
+        inbox.unwrap().unwrap();
         assert_eq!(journal.cursor().unwrap(), 2);
         if conflicted {
             assert_eq!(journal.counts().unwrap(), (0, 1));
