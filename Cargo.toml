@@ -24,7 +24,7 @@ nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-Open
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
 nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "ad614122d5916accbe1cca198768968b8c5bad0e" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "d9e6514c792ba1d96d5e6674b952ad7403c2fc3b" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "0c6bb254b72cbbcd85328f03cbeb62451b0c19ca" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -41,14 +41,13 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "pr
 
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
+rusqlite = { version = "=0.41.1", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
-rusqlite = { version="=0.40.2",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
-# rusqlite 0.40.2 requires sqlite-wasm-rs 0.5; VFS 0.3 uses incompatible
-# rsqlite-vfs 0.2 callbacks. Upgrade this pair with a compatible rusqlite release.
-sqlite-wasm-rs = "=0.5.5"
-sqlite-wasm-vfs = "=0.2.0"
+rusqlite = { version="=0.41.1",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
+# Keep the native/browser wrappers and their VFS callbacks in one API family.
+sqlite-wasm-rs = "=0.6.2"
+sqlite-wasm-vfs = "=0.3.0"
 wasm-bindgen = "=0.2.130"
 wasm-bindgen-futures = "=0.4.80"
 js-sys = "=0.3.107"
