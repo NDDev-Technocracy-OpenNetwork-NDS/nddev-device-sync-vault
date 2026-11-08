@@ -43,6 +43,7 @@ async function run(argv: string[], cwd: string, seconds = 120): Promise<string> 
       // Preserve it when collecting artifact paths instead of losing the cause.
       if (argv.includes("--message-format=json")) {
         for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
           const message: unknown = JSON.parse(line);
           if (
             object(message) &&
