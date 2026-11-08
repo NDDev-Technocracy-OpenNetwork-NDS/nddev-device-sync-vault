@@ -10,6 +10,8 @@ mod fence;
 mod io;
 mod observations;
 mod receipts;
+#[cfg(windows)]
+mod windows;
 struct Owned(std::path::PathBuf);
 impl Drop for Owned {
     fn drop(&mut self) {
