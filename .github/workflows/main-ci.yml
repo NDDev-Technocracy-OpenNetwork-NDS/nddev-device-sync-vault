@@ -28,7 +28,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+        uses: NDDev-Technocracy-OpenNetwork/nddev-ci/actions/hosted-sdk@52d8302d2272967a21fd8e3ae594205588648777 # v0.6.28
+        with:
+          rust-version: '1.99.1'
+          rust-components: rustfmt,clippy
+          rust-targets: wasm32-unknown-unknown
+          tools: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-nextest@0.9.149
       - name: Restore the Cargo dependency and tool cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -40,10 +45,6 @@ jobs:
           bun-version-file: package.json
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
-      - name: Install pinned quality tools
-        uses: NDDev-Technocracy-OpenNetwork/nddev-ci/actions/hosted-sdk@52d8302d2272967a21fd8e3ae594205588648777 # v0.6.28
-        with:
-          tools: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-nextest@0.9.149
       - name: Prepare locked source inputs
         uses: NDDev-Technocracy-OpenNetwork/nddev-ci/actions/recipe@52d8302d2272967a21fd8e3ae594205588648777 # v0.6.28
         with:
@@ -79,7 +80,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+      - name: Prepare the declared Rust SDK
+        uses: NDDev-Technocracy-OpenNetwork/nddev-ci/actions/hosted-sdk@52d8302d2272967a21fd8e3ae594205588648777 # v0.6.28
+        with:
+          rust-version: '1.99.1'
+          rust-components: rustfmt,clippy
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
       - run: cargo fmt --check
