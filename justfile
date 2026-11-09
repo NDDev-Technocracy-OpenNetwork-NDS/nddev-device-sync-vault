@@ -1,10 +1,12 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# List the project commands.
+default:
+    @just --list
+
 check: browser-check
+    just --fmt --check
     cargo fmt --check
-    cargo test --locked --all-features --jobs 4
-    cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
-    cargo audit --deny warnings
     cargo deny --locked check licenses sources
 
 # The large debug acceptance future needs a bounded test-runner thread stack.
@@ -56,6 +58,28 @@ wasm-check:
     cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown --jobs 4 -- -D warnings
 
 browser-check:
-    bun install --frozen-lockfile --ignore-scripts
     bun run check
+
+# Fetch locked source dependencies without compiling.
+setup:
+    cargo fetch --locked
+    bun install --frozen-lockfile --ignore-scripts
+
+# Test the native and browser adapters.
+test: build audit wasm-check
+    cargo test --locked --all-features --jobs 4
+    cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
+    cargo test --locked --doc --jobs 4
+    bun test --reporter=junit --reporter-outfile=.nddev-reports/bun-test.xml
     bun run check:generated
+
+# Compile the locked release workspace.
+build:
+    cargo build --locked --release --all-features --jobs 4
+
+# Check current RustSec advisories.
+audit:
+    cargo audit --deny warnings
+
+# Run source checks, native tests and the advisory audit.
+verify: check test audit build
