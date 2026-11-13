@@ -17,6 +17,7 @@ jobs:
     permissions:
       contents: read
     with:
+      setup: true
       rust-version: 1.99.1
       rust-components: clippy,rustfmt
       rust-targets: wasm32-unknown-unknown
