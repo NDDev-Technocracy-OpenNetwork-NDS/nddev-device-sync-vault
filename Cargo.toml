@@ -41,16 +41,16 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "pr
 
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
+rusqlite = { version = "=0.42.0", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
-rusqlite = { version="=0.40.2",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
+rusqlite = { version="=0.42.0",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
 # rusqlite 0.40.2 requires sqlite-wasm-rs 0.5; VFS 0.3 uses incompatible
 # rsqlite-vfs 0.2 callbacks. Upgrade this pair with a compatible rusqlite release.
-sqlite-wasm-rs = "=0.5.5"
-sqlite-wasm-vfs = "=0.2.0"
-wasm-bindgen = "=0.2.129"
-wasm-bindgen-futures = "=0.4.79"
-js-sys = "=0.3.106"
+sqlite-wasm-rs = "=0.6.3"
+sqlite-wasm-vfs = "=0.3.0"
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "=0.4.80"
+js-sys = "=0.3.107"
 uuid = { version="1.27",features=["js"] }
 ring = { version="0.17",features=["wasm32_unknown_unknown_js"] }
