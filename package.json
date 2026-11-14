@@ -10,7 +10,7 @@
     "check:generated": "bun run generate && git diff --exit-code -- src/browser_journal.js src/browser_worker.js"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.15",
+    "@biomejs/biome": "2.6.7",
     "typescript": "7.0.2"
   }
 }
