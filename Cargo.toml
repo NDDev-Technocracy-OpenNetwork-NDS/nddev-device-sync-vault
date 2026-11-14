@@ -20,11 +20,11 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "98f8a98cd6d9c2e679a5cc566de9a4128dbb34f6" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "c942a9ec95b11824d86e9842d2c0e3be340f3728" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
 nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "ad614122d5916accbe1cca198768968b8c5bad0e" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "3bd0c8d4d8b9ad29816ef24b22f1451f1a0f3adc" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "95fa88b20e027f8b0fc62b33f8e5a02672dc4a7c" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -41,16 +41,16 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "pr
 
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
+rusqlite = { version = "=0.42.0", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
-rusqlite = { version="=0.40.2",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
-# rusqlite 0.40.2 requires sqlite-wasm-rs 0.5; VFS 0.3 uses incompatible
-# rsqlite-vfs 0.2 callbacks. Upgrade this pair with a compatible rusqlite release.
-sqlite-wasm-rs = "=0.5.5"
-sqlite-wasm-vfs = "=0.2.0"
-wasm-bindgen = "=0.2.129"
-wasm-bindgen-futures = "=0.4.79"
-js-sys = "=0.3.106"
+rusqlite = { version="=0.42.0",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
+# rusqlite 0.42.0 requires sqlite-wasm-rs 0.6, which shares rsqlite-vfs 0.2 with VFS 0.3, so the
+# pair moves together.
+sqlite-wasm-rs = "=0.6.3"
+sqlite-wasm-vfs = { version = "=0.3.0", features = ["sahpool"] }
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "=0.4.80"
+js-sys = "=0.3.107"
 uuid = { version="1.27",features=["js"] }
 ring = { version="0.17",features=["wasm32_unknown_unknown_js"] }
