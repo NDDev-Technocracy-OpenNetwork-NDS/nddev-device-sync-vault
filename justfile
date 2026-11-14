@@ -59,3 +59,38 @@ browser-check:
     bun install --frozen-lockfile --ignore-scripts
     bun run check
     bun run check:generated
+
+# The checks the former CI library ran from .github/nddev-ci.toml; CI calls them through
+# `just test` on a pull request and `just verify` on dev.
+test:
+    cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
+    cargo test --locked --all-features --jobs 4
+    cargo test --locked --doc --jobs 4
+    bun --version
+    bun x biome format src
+    bun run check
+    bun x tsc --noEmit
+    bun test --reporter=junit --reporter-outfile=.nddev-reports/bun-test.xml
+
+ci-extras:
+    cargo audit --deny warnings
+    cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
+
+ci-policy:
+    cargo deny --locked check licenses sources
+
+ci-build:
+    cargo build --locked --release --all-features --jobs 4
+    bun run check:generated
+
+verify:
+    just check
+    just test
+    just ci-policy
+    just ci-extras
+    just ci-build
+
+# GitHub's runners lack the credential-store build inputs this workspace links; CI runs this
+# before the checks (setup: true).
+setup:
+    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then sudo apt-get update -qq && sudo apt-get install -qq --no-install-recommends -y libsecret-1-dev; fi
