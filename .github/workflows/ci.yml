@@ -18,7 +18,7 @@ jobs:
       contents: read
     with:
       setup: true
-      rust-version: 1.99.1
+      rust-version: 1.100.0
       rust-components: clippy,rustfmt
       rust-targets: wasm32-unknown-unknown
       bun-version: 1.4.4
@@ -38,5 +38,5 @@ jobs:
       hosted-runner: ${{ matrix.os }}
       prepare: native-setup
       recipe: native-check
-      rust-version: 1.99.1
+      rust-version: 1.100.0
       rust-components: clippy,rustfmt
