@@ -286,3 +286,13 @@ SDK loss and sink failures fail the check. This tests NDS synchronization with
 generated inputs, not GitHub-provider discovery or 32 different hardware devices.
 
 Release journals live in [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault/releases).
+
+## CI coverage
+
+Pull requests run source checks and native/browser unit checks. Development and
+manual runs additionally compile the browser target, audit dependencies, build
+the release and exercise native format, all-feature Clippy and tests on Ubuntu
+26.04, macOS 15 and Windows 2025 through the shared CI library. Windows 2025
+replaces the previous provider label; its real run qualifies that replacement.
+The Linux release build retains the Ubuntu 24.04 ABI baseline. Connected browser
+storage and the explicit owned-fixture acceptance recipes remain separate gates.

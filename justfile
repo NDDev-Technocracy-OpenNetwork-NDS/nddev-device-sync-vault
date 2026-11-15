@@ -1,11 +1,9 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# Source-only; setup prepares locked packages before this recipe.
 check: browser-check
     cargo fmt --check
-    cargo test --locked --all-features --jobs 4
-    cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
-    cargo audit --deny warnings
-    cargo deny --locked check licenses sources
+    cargo deny --frozen check licenses sources
 
 # The large debug acceptance future needs a bounded test-runner thread stack.
 # This does not change application/runtime thread stacks or process limits.
@@ -56,7 +54,6 @@ wasm-check:
     cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown --jobs 4 -- -D warnings
 
 browser-check:
-    bun install --frozen-lockfile --ignore-scripts
     bun run check
     bun run check:generated
 
@@ -76,21 +73,24 @@ ci-extras:
     cargo audit --deny warnings
     cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
 
-ci-policy:
-    cargo deny --locked check licenses sources
-
 ci-build:
     cargo build --locked --release --all-features --jobs 4
-    bun run check:generated
 
 verify:
     just check
     just test
-    just ci-policy
     just ci-extras
     just ci-build
 
-# GitHub's runners lack the credential-store build inputs this workspace links; CI runs this
-# before the checks (setup: true).
-setup:
-    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then sudo apt-get update -qq && sudo apt-get install -qq --no-install-recommends -y libsecret-1-dev; fi
+# The same native configuration the former platform matrix exercised.
+native-check:
+    cargo fmt --check
+    cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
+    cargo test --locked --all-features --jobs 4
+
+native-setup:
+    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-Linux}" = Linux ]; then sudo apt-get update -qq && sudo apt-get install -qq --no-install-recommends -y libsecret-1-dev; fi
+    cargo fetch --locked
+
+setup: native-setup
+    bun install --frozen-lockfile --ignore-scripts
