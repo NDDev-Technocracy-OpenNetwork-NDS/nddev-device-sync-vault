@@ -296,3 +296,7 @@ the release and exercise native format, all-feature Clippy and tests on Ubuntu
 replaces the previous provider label; its real run qualifies that replacement.
 The Linux release build retains the Ubuntu 24.04 ABI baseline. Connected browser
 storage and the explicit owned-fixture acceptance recipes remain separate gates.
+
+After the complete same-repository development workflow succeeds, promotion
+advances main with the repository's isolated promotion key. The project's
+existing release and deployment commands keep their own lifecycle.
