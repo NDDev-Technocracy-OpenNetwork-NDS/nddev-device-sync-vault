@@ -107,7 +107,7 @@ pub async fn worker_open(scope: String) -> Result<(), Error> {
     let pool = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(&cfg, true)
         .await
         .map_err(|_| Error::Unavailable)?;
-    pool.pause_vfs().map_err(|_| Error::Unavailable)?;
+    pool.pause().map_err(|_| Error::Unavailable)?;
     SCOPE.with(|s| s.replace(Some(scope)));
     POOL.with(|s| s.replace(Some(pool)));
     Ok(())
@@ -116,7 +116,7 @@ pub async fn worker_resume() -> Result<(), Error> {
     let pool = POOL
         .with(|s| s.borrow_mut().take())
         .ok_or(Error::Unavailable)?;
-    let result = pool.unpause_vfs().await.map_err(|_| Error::Unavailable);
+    let result = pool.resume().await.map_err(|_| Error::Unavailable);
     POOL.with(|s| s.replace(Some(pool)));
     result
 }
@@ -125,7 +125,7 @@ pub fn worker_pause() -> Result<(), Error> {
         s.borrow()
             .as_ref()
             .ok_or(Error::Unavailable)?
-            .pause_vfs()
+            .pause()
             .map_err(|_| Error::Unavailable)
     })
 }
