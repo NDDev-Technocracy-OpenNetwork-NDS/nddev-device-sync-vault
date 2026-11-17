@@ -250,7 +250,10 @@ fn checkpoint_crash_child() {
             .unwrap();
         j.stage_delta(&g, 9, &[], 9, false).unwrap();
     }
-    std::fs::write(root.join("ready"), key.id()).unwrap();
+    // The parent may kill us as soon as ready exists; publish its complete payload.
+    let ready = root.join("ready.tmp");
+    std::fs::write(&ready, key.id()).unwrap();
+    std::fs::rename(ready, root.join("ready")).unwrap();
     loop {
         std::thread::park();
     }
