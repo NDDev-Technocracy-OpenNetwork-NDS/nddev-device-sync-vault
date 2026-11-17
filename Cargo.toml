@@ -41,10 +41,10 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "pr
 
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusqlite = { version = "=0.42.0", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
+rusqlite = { version = "=0.43.0", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
-rusqlite = { version="=0.42.0",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
+rusqlite = { version="=0.43.0",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
 # rusqlite 0.42.0 requires sqlite-wasm-rs 0.6, which shares rsqlite-vfs 0.2 with VFS 0.3, so the
 # pair moves together.
 sqlite-wasm-rs = "=0.6.3"
