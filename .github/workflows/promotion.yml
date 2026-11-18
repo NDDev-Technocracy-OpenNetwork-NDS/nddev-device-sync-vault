@@ -17,7 +17,7 @@ jobs:
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'dev' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
-    uses: NDDev-Technocracy-OpenNetwork/nddev-ci/.github/workflows/promote.yml@6e3000e74bc68c0b01ed4d1f7e5b85132e5f4493 # v0.6.75
+    uses: NDDev-Technocracy-OpenNetwork/nddev-ci/.github/workflows/promote.yml@d70fed9613e0861124f6990fb2f4513d24741f26 # v0.6.76
     secrets: inherit # zizmor: ignore[secrets-inherit] the dev-only promotion environment holds the key
     permissions:
       actions: write
