@@ -20,11 +20,11 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "c942a9ec95b11824d86e9842d2c0e3be340f3728" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "4f8c36ec4d54f1560ad39fc28b1f95c6bf763727" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
 nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "ad614122d5916accbe1cca198768968b8c5bad0e" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "1e65cfb2e03459f3ae4cab92f6a036dd53e2f77c" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "d0f04dc184f04388afd7f1bdd7383194181af01e" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
