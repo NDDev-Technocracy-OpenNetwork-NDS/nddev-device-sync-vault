@@ -600,7 +600,7 @@ struct ReadReplyHold {
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ReplicaLease {
-    _batch: std::fs::File,
+    _batch: crate::journal::ReplicaFileLock,
     _owner: Arc<std::fs::File>,
 }
 impl Storage {

@@ -25,8 +25,10 @@ fn replica_lock_excludes_other_handles_and_processes_without_locking_keys() {
             .unwrap()
             .success()
     );
+    let duplicate = lease.0.try_clone().unwrap();
     drop(lease);
     let _next = other.replica_lock().unwrap();
+    drop(duplicate);
 }
 
 #[cfg(not(target_arch = "wasm32"))]

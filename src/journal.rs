@@ -9,6 +9,17 @@ use std::{path::PathBuf, time::Duration};
 
 pub(crate) const SCHEMA_VERSION: u32 = 8;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ReplicaFileLock(File);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for ReplicaFileLock {
+    fn drop(&mut self) {
+        // A duplicate or briefly inherited descriptor must not extend the completed batch.
+        let _ = self.0.unlock();
+    }
+}
+
 fn check_version(connection: &Connection) -> Result<(), Error> {
     let version: u32 = connection
         .query_row(
@@ -270,8 +281,8 @@ impl Journal {
     /// Separate from key provisioning: every native replica batch for this
     /// durable scope must retain this lease through its actual storage I/O.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn replica_lock(&self) -> Result<File, Error> {
-        self.lock("replica-lock")
+    pub(crate) fn replica_lock(&self) -> Result<ReplicaFileLock, Error> {
+        self.lock("replica-lock").map(ReplicaFileLock)
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn owner_lock(&self) -> Result<File, Error> {
