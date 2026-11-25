@@ -13,7 +13,7 @@ permissions: {}
 
 jobs:
   check:
-    uses: NDDev-Technocracy-OpenNetwork/nddev-ci/.github/workflows/check.yml@b2cb3d17849fe01da3af238332d5c698004d4613 # v0.6.163
+    uses: NDDev-Technocracy-OpenNetwork/nddev-ci/.github/workflows/check.yml@65901e0f87cb8bc931c2f92ff60c319859aec60b # v0.6.164
     permissions:
       contents: read
     with:
@@ -30,7 +30,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04, macos-15, windows-2025]
-    uses: NDDev-Technocracy-OpenNetwork/nddev-ci/.github/workflows/recipe.yml@b2cb3d17849fe01da3af238332d5c698004d4613 # v0.6.163
+    uses: NDDev-Technocracy-OpenNetwork/nddev-ci/.github/workflows/recipe.yml@65901e0f87cb8bc931c2f92ff60c319859aec60b # v0.6.164
     permissions:
       contents: read
     with:
